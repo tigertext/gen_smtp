@@ -24,9 +24,10 @@
 
 -module(smtp_util).
 -export([
-		mxlookup/1, guess_FQDN/0, compute_cram_digest/2, get_cram_string/1,
-		trim_crlf/1, rfc5322_timestamp/0, zone/0, generate_message_id/0,
-		generate_message_boundary/0]).
+    mxlookup/1, guess_FQDN/0, compute_cram_digest/2, get_cram_string/1,
+    trim_crlf/1, rfc5322_timestamp/0, zone/0, generate_message_id/0,
+    get_source_ip_from_proxy/1,
+    generate_message_boundary/0]).
 
 %% @doc returns a sorted list of mx servers for `Domain', lowest distance first
 mxlookup(Domain) ->
@@ -110,5 +111,24 @@ generate_message_boundary() ->
 	FQDN = guess_FQDN(),
 	["_=", [io_lib:format("~2.36.0b", [X]) || <<X>> <= erlang:md5(term_to_binary([erlang:now(), FQDN]))], "=_"].
 
+get_source_ip_from_proxy(Params) ->
+    Tokens = binstr:split(Params, <<" ">>),
+    Len = length(Tokens),
+    case Len > 1 of 
+        false -> undefined;
+        true -> [Protocol|Other_Params] = Tokens,
+                case Protocol of
+                    <<"TCP4">> -> get_source_from_proxy_command(Tokens, Len); 
+                    <<"TCP6">> -> get_source_from_proxy_command(Tokens, Len);
+                    _ -> undefined
+                end
+   end.
 
+get_source_from_proxy_command(Tokens, Len) when Len < 2 -> undefined;
+get_source_from_proxy_command(Tokens, Len) ->
+    [_Protocol, S_IP|_] = Tokens,
+    case inet:parse_address(binary_to_list(S_IP)) of
+        {ok, Result} -> Result;
+        _ -> undefined
+    end.
 
