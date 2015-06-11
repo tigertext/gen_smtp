@@ -241,7 +241,6 @@ parse_request(Packet) ->
 	Request = binstr:strip(binstr:strip(binstr:strip(binstr:strip(Packet, right, $\n), right, $\r), right, $\s), left, $\s),
 	case binstr:strchr(Request, $\s) of
 		0 ->
-			% io:format("got a ~s request~n", [Request]),
 			case binstr:to_upper(Request) of
 				<<"QUIT">> = Res -> {Res, <<>>};
 				<<"DATA">> = Res -> {Res, <<>>};
@@ -251,7 +250,6 @@ parse_request(Packet) ->
 		Index ->
 			Verb = binstr:substr(Request, 1, Index - 1),
 			Parameters = binstr:strip(binstr:substr(Request, Index + 1), left, $\s),
-			%io:format("got a ~s request with parameters ~s~n", [Verb, Parameters]),
 			{binstr:to_upper(Verb), Parameters}
 	end.
 
@@ -259,6 +257,14 @@ parse_request(Packet) ->
 handle_request({<<>>, _Any}, #state{socket = Socket} = State) ->
 	socket:send(Socket, "500 Error: bad syntax\r\n"),
 	{ok, State};
+handle_request({<<"PROXY">>, Params}, #state{module = Module, callbackstate = OldCallbackState} = State) ->
+  New_State = case smtp_util:get_source_ip_from_proxy(Params) of
+      undefined -> State;
+      Ip -> %% save for mail session
+          {ok, CallbackState} = Module:update_source_ip(Ip, OldCallbackState),
+          State#state{callbackstate = CallbackState}
+  end,
+	{ok, New_State};
 handle_request({<<"HELO">>, <<>>}, #state{socket = Socket} = State) ->
 	socket:send(Socket, "501 Syntax: HELO hostname\r\n"),
 	{ok, State};
