@@ -360,7 +360,6 @@ handle_request({<<"AUTH">>, Args}, #state{socket = Socket, extensions = Extensio
 							socket:send(Socket, "334\r\n"),
 							{ok, State#state{waitingauth = 'plain', envelope = Envelope#envelope{auth = {<<>>, <<>>}}}};
 						<<"CRAM-MD5">> ->
-							crypto:start(), % ensure crypto is started, we're gonna need it
 							String = smtp_util:get_cram_string(proplists:get_value(hostname, Options, smtp_util:guess_FQDN())),
 							socket:send(Socket, ["334 ", String, "\r\n"]),
 							{ok, State#state{waitingauth = 'cram-md5', authdata=base64:decode(String), envelope = Envelope#envelope{auth = {<<>>, <<>>}}}}
@@ -577,7 +576,6 @@ handle_request({<<"STARTTLS">>, <<>>}, #state{socket = Socket, module = Module, 
 	case has_extension(Extensions, "STARTTLS") of
 		{true, _} ->
 			socket:send(Socket, "220 OK\r\n"),
-			crypto:start(),
 			application:start(public_key),
 			application:start(ssl),
 			Options1 = case proplists:get_value(certfile, Options) of
