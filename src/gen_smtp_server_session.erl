@@ -577,7 +577,6 @@ handle_request({<<"STARTTLS">>, <<>>}, #state{socket = Socket, module = Module, 
 		{true, _} ->
 			socket:send(Socket, "220 OK\r\n"),
 			application:start(public_key),
-			application:start(ssl),
 			Options1 = case proplists:get_value(certfile, Options) of
 				undefined ->
 					[];
