@@ -264,7 +264,7 @@ type(_Socket) ->
 %%%-----------------------------------------------------------------
 
 get_tls_versions() ->
-    application:get_env(email_gateway, tls_versions, [ "tlsv1.1", "tlsv1.2" ]).
+    application:get_env(email_gateway, tls_versions, [ 'tlsv1.1', 'tlsv1.2' ]).
 
 get_ciphers() ->
     application:get_env(email_gateway, ciphers, [ "ECDHE-ECDSA-AES128-SHA256", "ECDHE-ECDSA-AES128-SHA" ]).
