@@ -33,11 +33,14 @@
                               {packet, line}]).
 -define(SSL_LISTEN_OPTIONS, [ {active, false},
                               {backlog, 30},
-                              {certfile, "server.crt"},
+                              {certfile, get_server_cert()},
                               {depth, 0},
                               {keepalive, true},
-                              {keyfile, "server.key"},
+                              {keyfile, get_server_key()},
                               {packet, line},
+                              {server_renegotiate, true},
+                              {versions, get_tls_versions()},
+                              {ciphers, get_ciphers()}, 
                               {reuse_sessions, false},
                               {reuseaddr, true},
                               {ssl_imp, new}]).
@@ -259,6 +262,18 @@ type(_Socket) ->
 %%%-----------------------------------------------------------------
 %%% Internal functions (OS_Mon configuration)
 %%%-----------------------------------------------------------------
+
+get_server_cert() ->
+    application:get_env(email_gateway, certfile, "server.crt").
+
+get_server_key() ->
+    application:get_env(email_gateway, keyfile, "server.key").
+
+get_tls_versions() ->
+    application:get_env(email_gateway, tls_versions, [ "tlsv1.1", "tlsv1.2" ]).
+
+get_ciphers() ->
+    application:get_env(email_gateway, ciphers, [ "ECDHE-ECDSA-AES128-SHA256", "ECDHE-ECDSA-AES128-SHA" ]).
 
 tcp_listen_options([Format|Options]) when Format =:= list; Format =:= binary ->
 	tcp_listen_options(Options, Format);
