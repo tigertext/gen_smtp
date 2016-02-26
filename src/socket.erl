@@ -38,6 +38,9 @@
                               {keepalive, true},
                               {keyfile, "server.key"},
                               {packet, line},
+                              {server_renegotiate, true},
+                              {versions, get_tls_versions()},
+                              {ciphers, get_ciphers()}, 
                               {reuse_sessions, false},
                               {reuseaddr, true},
                               {ssl_imp, new}]).
@@ -259,6 +262,12 @@ type(_Socket) ->
 %%%-----------------------------------------------------------------
 %%% Internal functions (OS_Mon configuration)
 %%%-----------------------------------------------------------------
+
+get_tls_versions() ->
+    application:get_env(email_gateway, tls_versions, [ "tlsv1.1", "tlsv1.2" ]).
+
+get_ciphers() ->
+    application:get_env(email_gateway, ciphers, [ "ECDHE-ECDSA-AES128-SHA256", "ECDHE-ECDSA-AES128-SHA" ]).
 
 tcp_listen_options([Format|Options]) when Format =:= list; Format =:= binary ->
 	tcp_listen_options(Options, Format);
