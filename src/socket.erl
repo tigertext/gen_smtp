@@ -33,10 +33,10 @@
                               {packet, line}]).
 -define(SSL_LISTEN_OPTIONS, [ {active, false},
                               {backlog, 30},
-                              {certfile, get_server_cert()},
+                              {certfile, "server.crt"},
                               {depth, 0},
                               {keepalive, true},
-                              {keyfile, get_server_key()},
+                              {keyfile, "server.key"},
                               {packet, line},
                               {server_renegotiate, true},
                               {versions, get_tls_versions()},
@@ -262,12 +262,6 @@ type(_Socket) ->
 %%%-----------------------------------------------------------------
 %%% Internal functions (OS_Mon configuration)
 %%%-----------------------------------------------------------------
-
-get_server_cert() ->
-    application:get_env(email_gateway, certfile, "server.crt").
-
-get_server_key() ->
-    application:get_env(email_gateway, keyfile, "server.key").
 
 get_tls_versions() ->
     application:get_env(email_gateway, tls_versions, [ "tlsv1.1", "tlsv1.2" ]).
