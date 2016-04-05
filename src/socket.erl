@@ -40,6 +40,7 @@
                               {packet, line},
                               {server_renegotiate, true},
                               {versions, get_tls_versions()},
+                              {ciphers, get_ciphers()},
                               {reuse_sessions, false},
                               {reuseaddr, true},
                               {ssl_imp, new}]).
@@ -47,6 +48,7 @@
                               {depth, 0},
                               {packet, line},
                               {ssl_imp, new}]).
+
 
 -ifdef(TEST).
 -include_lib("eunit/include/eunit.hrl").
@@ -263,10 +265,10 @@ type(_Socket) ->
 %%%-----------------------------------------------------------------
 
 get_tls_versions() ->
-    application:get_env(email_gateway, tls_versions, [ 'tlsv1.1', 'tlsv1.2' ]).
+    application:get_env(email_gateway, tls_versions, ['tlsv1', 'tlsv1.1', 'tlsv1.2' ]).
 
-%get_ciphers() ->
-%    application:get_env(email_gateway, ciphers, [ "ECDHE-ECDSA-AES128-SHA256", "ECDHE-ECDSA-AES128-SHA" ]).
+get_ciphers() ->
+    application:get_env(email_gateway, ciphers, ['des_cbc', '3des_ede_cbc', 'aes_128_cbc', 'aes_256_cbc', 'aes_128_gcm', 'aes_256_gcm']).
 
 tcp_listen_options([Format|Options]) when Format =:= list; Format =:= binary ->
 	tcp_listen_options(Options, Format);
