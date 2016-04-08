@@ -303,9 +303,7 @@ get_ciphers() ->
           {dhe_dss,aes_128_cbc,sha},
           {ecdh_ecdsa,aes_128_cbc,sha},
           {ecdh_rsa,aes_128_cbc,sha},
-          {rsa,aes_128_cbc,sha},
-          {dhe_rsa,des_cbc,sha},
-          {rsa,des_cbc,sha}]
+          {rsa,aes_128_cbc,sha}
           ).
 
 tcp_listen_options([Format|Options]) when Format =:= list; Format =:= binary ->
