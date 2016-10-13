@@ -44,8 +44,6 @@
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2,
 		code_change/3]).
 
--export([behaviour_info/1]).
-
 -record(envelope,
 	{
 		from :: binary() | 'undefined',
@@ -71,28 +69,35 @@
 	}
 ).
 
-%% @hidden
--spec behaviour_info(atom()) -> [{atom(), non_neg_integer()}] | 'undefined'.
-behaviour_info(callbacks) ->
-	[{init,4},
-	  {terminate,2},
-	  {code_change,3},
-	  {handle_HELO,2},
-	  {handle_EHLO,3},
-	  {handle_MAIL,2},
-	  {handle_MAIL_extension,2},
-	  {handle_RCPT,2},
-	  {handle_RCPT_extension,2},
-	  {handle_DATA,4},
-	  {handle_RSET,1},
-	  {handle_VRFY,2},
-	  {handle_other,3}];
-behaviour_info(_Other) ->
-	undefined.
+-type(state() :: any()).
+-type(error_message() :: {'error', string(), state()}).
+
+-callback code_change(OldVsn :: any(), State :: state(), Extra :: any()) ->  {'ok', state()}.
+-callback handle_HELO(Hostname :: binary(), State :: state()) ->
+    {'ok', pos_integer(), state()} | {'ok', state()} | error_message().
+-callback handle_EHLO(Hostname :: binary(), Extensions :: list(), State :: state()) ->
+    {'ok', list(), state()} | error_message().
+-callback handle_MAIL(From :: binary(), State :: state()) ->
+    {'ok', state()} | {'error', string(), state()}.
+-callback handle_MAIL_extension(Extension :: binary(), State :: state()) ->
+    {'ok', state()} | 'error'.
+-callback handle_RCPT(To :: binary(), State :: state()) ->
+    {'ok', state()} | {'error', string(), state()}.
+-callback handle_RCPT_extension(Extension :: binary(), State :: state()) ->
+    {'ok', state()} | 'error'.
+-callback handle_DATA(From :: binary(), To :: [binary(),...], Data :: binary(), State :: state()) ->
+    {'ok', string(), state()} | {'error', string(), state()}.
+-callback handle_RSET(State :: state()) -> state().
+-callback handle_VRFY(Address :: binary(), State :: state()) ->
+    {'ok', string(), state()} | {'error', string(), state()}.
+-callback handle_other(Verb :: binary(), Args :: binary(), state()) ->
+                          {string() | 'noreply', state()}.
+
+
 
 %% @doc Start a SMTP session linked to the calling process.
 %% @see start/3
--spec(start_link/3 :: (Socket :: port(), Module :: atom(), Options :: [tuple()]) -> {'ok', pid()} | 'ignore' | {'error', any()}).
+-spec start_link(Socket :: port(), Module :: atom(), Options :: [tuple()]) -> {'ok', pid()} | 'ignore' | {'error', any()}.
 start_link(Socket, Module, Options) ->
 	gen_server:start_link(?MODULE, [Socket, Module, Options], []).
 
@@ -101,12 +106,12 @@ start_link(Socket, Module, Options) ->
 %% via the `socket' module, `Module' is the name of the callback module
 %% implementing the SMTP session behaviour that you'd like to use and `Options'
 %% is the optional arguments provided by the accept server.
--spec(start/3 :: (Socket :: port(), Module :: atom(), Options :: [tuple()]) -> {'ok', pid()} | 'ignore' | {'error', any()}).
+-spec start(Socket :: port(), Module :: atom(), Options :: [tuple()]) -> {'ok', pid()} | 'ignore' | {'error', any()}.
 start(Socket, Module, Options) ->
 	gen_server:start(?MODULE, [Socket, Module, Options], []).
 
 %% @private
--spec(init/1 :: (Args :: list()) -> {'ok', #state{}, ?TIMEOUT} | {'stop', any()} | 'ignore').
+-spec init(Args :: list()) -> {'ok', #state{}, ?TIMEOUT} | {'stop', any()} | 'ignore'.
 init([Socket, Module, Options]) ->
 	{ok, {PeerName, _Port}} = socket:peername(Socket),
 	case Module:init(proplists:get_value(hostname, Options, smtp_util:guess_FQDN()), proplists:get_value(sessioncount, Options, 0), PeerName, proplists:get_value(callbackoptions, Options, [])) of
@@ -155,7 +160,9 @@ handle_info({receive_data, Body, Rest}, #state{socket = Socket, readmessage = tr
 		_ -> self() ! {socket:get_proto(Socket), Socket, Rest}
 	end,
 	socket:setopts(Socket, [{packet, line}]),
-	Envelope = Env#envelope{data = Body},% size = length(Body)},
+	%% Unescape periods at start of line (rfc5321 4.5.2)
+	UnescapedBody = re:replace(Body, <<"^\\\.">>, <<>>, [global, multiline, {return, binary}]),
+	Envelope = Env#envelope{data = UnescapedBody},% size = length(Body)},
 	Valid = case has_extension(Extensions, "SIZE") of
 		{true, Value} ->
 			case byte_size(Envelope#envelope.data) > list_to_integer(Value) of
@@ -220,7 +227,7 @@ handle_info(Info, State) ->
 	{noreply, State}.
 
 %% @hidden
--spec(terminate/2 :: (Reason :: any(), State :: #state{}) -> 'ok').
+-spec terminate(Reason :: any(), State :: #state{}) -> 'ok'.
 terminate(Reason, State) ->
 	socket:close(State#state.socket),
 	(State#state.module):terminate(Reason, State#state.callbackstate).
@@ -236,7 +243,7 @@ code_change(OldVsn, #state{module = Module} = State, Extra) ->
 		end,
 	{ok, State#state{callbackstate = CallbackState}}.
 
--spec(parse_request/1 :: (Packet :: binary()) -> {binary(), binary()}).
+-spec parse_request(Packet :: binary()) -> {binary(), binary()}.
 parse_request(Packet) ->
 	Request = binstr:strip(binstr:strip(binstr:strip(binstr:strip(Packet, right, $\n), right, $\r), right, $\s), left, $\s),
 	case binstr:strchr(Request, $\s) of
@@ -253,7 +260,7 @@ parse_request(Packet) ->
 			{binstr:to_upper(Verb), Parameters}
 	end.
 
--spec(handle_request/2 :: ({Verb :: binary(), Args :: binary()}, State :: #state{}) -> {'ok', #state{}} | {'stop', any(), #state{}}).
+-spec handle_request({Verb :: binary(), Args :: binary()}, State :: #state{}) -> {'ok', #state{}} | {'stop', any(), #state{}}.
 handle_request({<<>>, _Any}, #state{socket = Socket} = State) ->
 	socket:send(Socket, "500 Error: bad syntax\r\n"),
 	{ok, State};
@@ -613,10 +620,15 @@ handle_request({<<"STARTTLS">>, _Args}, #state{socket = Socket} = State) ->
 	{ok, State};
 handle_request({Verb, Args}, #state{socket = Socket, module = Module, callbackstate = OldCallbackState} = State) ->
 	{Message, CallbackState} = Module:handle_other(Verb, Args, OldCallbackState),
-	socket:send(Socket, [Message, "\r\n"]),
+	maybe_reply(Message, Socket),
 	{ok, State#state{callbackstate = CallbackState}}.
 
--spec(parse_encoded_address/1 :: (Address :: binary()) -> {binary(), binary()} | 'error').
+-spec maybe_reply(Message :: string() | 'noreply', Socket :: socket:socket()) -> 'ok' | {'error', any()}.
+maybe_reply('noreply', _) -> 'ok';
+maybe_reply(Message, Socket) ->
+	socket:send(Socket, [Message, "\r\n"]).
+
+-spec parse_encoded_address(Address :: binary()) -> {binary(), binary()} | 'error'.
 parse_encoded_address(<<>>) ->
 	error; % empty
 parse_encoded_address(<<"<@", Address/binary>>) ->
@@ -633,7 +645,7 @@ parse_encoded_address(<<" ", Address/binary>>) ->
 parse_encoded_address(Address) ->
 	parse_encoded_address(Address, [], {false, false}).
 
--spec(parse_encoded_address/3 :: (Address :: binary(), Acc :: list(), Flags :: {boolean(), boolean()}) -> {binary(), binary()} | 'error').
+-spec parse_encoded_address(Address :: binary(), Acc :: list(), Flags :: {boolean(), boolean()}) -> {binary(), binary()} | 'error'.
 parse_encoded_address(<<>>, Acc, {_Quotes, false}) ->
 	{list_to_binary(lists:reverse(Acc)), <<>>};
 parse_encoded_address(<<>>, _Acc, {_Quotes, true}) ->
@@ -673,7 +685,7 @@ parse_encoded_address(_, _Acc, {false, _AB}) ->
 parse_encoded_address(<<H, Tail/binary>>, Acc, Quotes) ->
 	parse_encoded_address(Tail, [H | Acc], Quotes).
 
--spec(has_extension/2 :: (Extensions :: [{string(), string()}], Extension :: string()) -> {'true', string()} | 'false').
+-spec has_extension(Extensions :: [{string(), string()}], Extension :: string()) -> {'true', string()} | 'false'.
 has_extension(Exts, Ext) ->
 	Extension = string:to_upper(Ext),
 	Extensions = [{string:to_upper(X), Y} || {X, Y} <- Exts],
@@ -686,7 +698,7 @@ has_extension(Exts, Ext) ->
 	end.
 
 
--spec(try_auth/4 :: (AuthType :: 'login' | 'plain' | 'cram-md5', Username :: binary(), Credential :: binary() | {binary(), binary()}, State :: #state{}) -> {'ok', #state{}}).
+-spec try_auth(AuthType :: 'login' | 'plain' | 'cram-md5', Username :: binary(), Credential :: binary() | {binary(), binary()}, State :: #state{}) -> {'ok', #state{}}.
 try_auth(AuthType, Username, Credential, #state{module = Module, socket = Socket, envelope = Envelope, callbackstate = OldCallbackState} = State) ->
 	% clear out waiting auth
 	NewState = State#state{waitingauth = false, envelope = Envelope#envelope{auth = {<<>>, <<>>}}},
@@ -883,9 +895,9 @@ parse_encoded_address_test_() ->
 					?assertEqual(error, parse_encoded_address(<<"God@heaven.af.mil>">>))
 			end
 		},
-		{"Address longer than 129 character should fail",
+		{"Address longer than 320 characters should fail",
 			fun() ->
-					MegaAddress = list_to_binary(lists:seq(97, 122) ++ lists:seq(97, 122) ++ lists:seq(97, 122) ++ "@" ++ lists:seq(97, 122) ++ lists:seq(97, 122)),
+					MegaAddress = list_to_binary(lists:seq(97, 122) ++ lists:seq(97, 122) ++ lists:seq(97, 122) ++ lists:seq(97, 122) ++ lists:seq(97, 122) ++ lists:seq(97, 122) ++ "@" ++ lists:seq(97, 122) ++ lists:seq(97, 122) ++ lists:seq(97, 122) ++ lists:seq(97, 122) ++ lists:seq(97, 122) ++ lists:seq(97, 122) ++ lists:seq(97, 122)),
 					?assertEqual(error, parse_encoded_address(MegaAddress))
 			end
 		},
@@ -1754,9 +1766,7 @@ smtp_session_tls_test_() ->
 	{foreach,
 		local,
 		fun() ->
-				crypto:start(),
-				application:start(public_key),
-				application:start(ssl),
+				gen_smtp_application:ensure_all_started(gen_smtp),
 				Self = self(),
 				spawn(fun() ->
 							{ok, ListenSock} = socket:listen(tcp, 9876, [binary]),
@@ -1769,7 +1779,7 @@ smtp_session_tls_test_() ->
 					SSock when is_port(SSock) ->
 						ok
 				end,
-				{ok, Pid} = gen_smtp_server_session:start(SSock, smtp_server_example, [{keyfile, "../testdata/server.key"}, {certfile, "../testdata/server.crt"}, {hostname, "localhost"}, {sessioncount, 1}, {callbackoptions, [{auth, true}]}]),
+				{ok, Pid} = gen_smtp_server_session:start(SSock, smtp_server_example, [{keyfile, "test/fixtures/server.key"}, {certfile, "test/fixtures/server.crt"}, {hostname, "localhost"}, {sessioncount, 1}, {callbackoptions, [{auth, true}]}]),
 				socket:controlling_process(SSock, Pid),
 				{CSock, Pid}
 		end,

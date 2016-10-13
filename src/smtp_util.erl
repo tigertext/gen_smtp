@@ -24,10 +24,12 @@
 
 -module(smtp_util).
 -export([
-    mxlookup/1, guess_FQDN/0, compute_cram_digest/2, get_cram_string/1,
-    trim_crlf/1, rfc5322_timestamp/0, zone/0, generate_message_id/0,
-    get_source_ip_from_proxy/1,
-    generate_message_boundary/0]).
+		mxlookup/1, guess_FQDN/0, compute_cram_digest/2, get_cram_string/1,
+		trim_crlf/1, rfc5322_timestamp/0, zone/0, generate_message_id/0,
+         parse_rfc822_addresses/1,
+         combine_rfc822_addresses/1,
+         get_source_ip_from_proxy/1,
+         generate_message_boundary/0]).
 
 %% @doc returns a sorted list of mx servers for `Domain', lowest distance first
 mxlookup(Domain) ->
@@ -59,18 +61,18 @@ guess_FQDN() ->
 	FQDN.
 
 %% @doc Compute the CRAM digest of `Key' and `Data'
--spec(compute_cram_digest/2 :: (Key :: binary(), Data :: string()) -> binary()).
+-spec compute_cram_digest(Key :: binary(), Data :: string()) -> binary().
 compute_cram_digest(Key, Data) ->
-	Bin = crypto:md5_mac(Key, Data),
+	Bin = crypto:hmac(md5, Key, Data),
 	list_to_binary([io_lib:format("~2.16.0b", [X]) || <<X>> <= Bin]).
 
 %% @doc Generate a seed string for CRAM.
--spec(get_cram_string/1 :: (Hostname :: string()) -> string()).
+-spec get_cram_string(Hostname :: string()) -> string().
 get_cram_string(Hostname) ->
 	binary_to_list(base64:encode(lists:flatten(io_lib:format("<~B.~B@~s>", [crypto:rand_uniform(0, 4294967295), crypto:rand_uniform(0, 4294967295), Hostname])))).
 
 %% @doc Trim \r\n from `String'
--spec(trim_crlf/1 :: (String :: string()) -> string()).
+-spec trim_crlf(String :: string()) -> string().
 trim_crlf(String) ->
 	string:strip(string:strip(String, right, $\n), right, $\r).
 
@@ -103,13 +105,41 @@ zone(Val) when Val >= 0 ->
 %% @doc Generate a unique message ID 
 generate_message_id() ->
 	FQDN = guess_FQDN(),
-	Md5 = [io_lib:format("~2.16.0b", [X]) || <<X>> <= erlang:md5(term_to_binary([erlang:now(), FQDN]))],
+    Md5 = [io_lib:format("~2.16.0b", [X]) || <<X>> <= erlang:md5(term_to_binary([unique_id(), FQDN]))],
 	io_lib:format("<~s@~s>", [Md5, FQDN]).
 
 %% @doc Generate a unique MIME message boundary
 generate_message_boundary() ->
 	FQDN = guess_FQDN(),
-	["_=", [io_lib:format("~2.36.0b", [X]) || <<X>> <= erlang:md5(term_to_binary([erlang:now(), FQDN]))], "=_"].
+    ["_=", [io_lib:format("~2.36.0b", [X]) || <<X>> <= erlang:md5(term_to_binary([unique_id(), FQDN]))], "=_"].
+
+-ifdef(deprecated_now).
+unique_id() ->
+    erlang:unique_integer().
+-else.
+unique_id() ->
+    erlang:now().
+-endif.
+
+-define(is_whitespace(Ch), (Ch =< 32)).
+
+combine_rfc822_addresses(Addresses) ->
+	[_,_|Acc] = combine_rfc822_addresses(Addresses, []),
+	iolist_to_binary(lists:reverse(Acc)).
+
+combine_rfc822_addresses([], Acc) ->
+	Acc;
+combine_rfc822_addresses([{undefined, Email}|Rest], Acc) ->
+	combine_rfc822_addresses(Rest, [32, $,, Email|Acc]);
+combine_rfc822_addresses([{Name, Email}|Rest], Acc) ->
+	combine_rfc822_addresses(Rest, [32, $,, $>, Email, $<, 32, opt_quoted(Name)|Acc]).
+
+opt_quoted(N)  ->
+	case re:run(N, "\"") of
+		nomatch -> N;
+		{match, _} ->
+			[$", re:replace(N, "\"", "\\\\\"", [global]), $"]
+	end.
 
 get_source_ip_from_proxy(Params) ->
     Tokens = binstr:split(Params, <<" ">>),
@@ -132,3 +162,48 @@ get_source_from_proxy_command(Tokens, Len) ->
         _ -> undefined
     end.
 
+parse_rfc822_addresses(B) when is_binary(B) ->
+	parse_rfc822_addresses(binary_to_list(B));
+
+parse_rfc822_addresses(S) when is_list(S) ->
+	Scanned = lists:reverse([{'$end', 0}|scan_rfc822(S, [])]),
+	smtp_rfc822_parse:parse(Scanned).
+
+scan_rfc822([], Acc) ->
+	Acc;
+scan_rfc822([Ch|R], Acc) when ?is_whitespace(Ch) ->
+	scan_rfc822(R, Acc);
+scan_rfc822([$"|R], Acc) ->
+	{Token, Rest} = scan_rfc822_scan_endquote(R, [], false),
+	scan_rfc822(Rest, [{string, 0, Token}|Acc]);
+scan_rfc822([$,|Rest], Acc) ->
+	scan_rfc822(Rest, [{',', 0}|Acc]);
+scan_rfc822([$<|Rest], Acc) ->
+	{Token, R} = scan_rfc822_scan_endpointybracket(Rest),
+	scan_rfc822(R, [{'>', 0}, {string, 0, Token}, {'<', 0}|Acc]);
+scan_rfc822(String, Acc) ->
+	case re:run(String, "(.+?)([\s<>,].*)", [{capture, all_but_first, list}]) of
+		{match, [Token, Rest]} ->
+			scan_rfc822(Rest, [{string, 0, Token}|Acc]);
+		nomatch ->
+			[{string, 0, String}|Acc]
+	end.
+
+scan_rfc822_scan_endpointybracket(String) ->
+	case re:run(String, "(.*?)>(.*)", [{capture, all_but_first, list}]) of
+		{match, [Token, Rest]} ->
+			{Token, Rest};
+		nomatch ->
+			{String, []}
+	end.
+
+scan_rfc822_scan_endquote([$\\|R], Acc, InEscape) ->
+	%% in escape
+	scan_rfc822_scan_endquote(R, Acc, not(InEscape));
+scan_rfc822_scan_endquote([$"|R], Acc, true) ->
+	scan_rfc822_scan_endquote(R, [$"|Acc], false);
+scan_rfc822_scan_endquote([$"|Rest], Acc, false) ->
+	%% Done!
+	{lists:reverse(Acc), Rest};
+scan_rfc822_scan_endquote([Ch|Rest], Acc, _) ->
+	scan_rfc822_scan_endquote(Rest, [Ch|Acc], false).

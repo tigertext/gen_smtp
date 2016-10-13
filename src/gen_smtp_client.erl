@@ -48,7 +48,7 @@
 -export([send/2, send/3, send_blocking/2]).
 -endif.
 
--type email() :: {string() | binary(), [string() | binary(), ...], string() | binary() | function()}. 
+-type email() :: {string() | binary(), [string() | binary(), ...], string() | binary() | function()}.
 
 -spec send(Email :: {string() | binary(), [string() | binary(), ...], string() | binary() | function()}, Options :: list()) -> {'ok', pid()} | {'error', any()}.
 %% @doc Send an email in a non-blocking fashion via a spawned_linked process.
@@ -138,42 +138,59 @@ send_it(Email, Options) ->
 	try_smtp_sessions(Hosts, Email, Options, []).
 
 -spec try_smtp_sessions(Hosts :: [{non_neg_integer(), string()}, ...], Email :: email(), Options :: list(), RetryList :: list()) -> binary() | {'error', any(), any()}.
-try_smtp_sessions([{Distance, Host} | Tail], Email, Options, RetryList) ->
-	Retries = proplists:get_value(retries, Options),
+try_smtp_sessions([{_Distance, Host} | _Tail] = Hosts, Email, Options, RetryList) ->
 	try do_smtp_session(Host, Email, Options) of
 		Res -> Res
 	catch
-		throw:{permanent_failure, Message} ->
-			% permanent failure means no retries, and don't even continue with other hosts
-			{error, no_more_hosts, {permanent_failure, Host, Message}};
-		throw:{FailureType, Message} ->
-			case proplists:get_value(Host, RetryList) of
-				RetryCount when is_integer(RetryCount), RetryCount >= Retries ->
-					% out of chances
-					%io:format("retries for ~s exceeded (~p of ~p)~n", [Host, RetryCount, Retries]),
-					NewHosts = Tail,
-					NewRetryList = lists:keydelete(Host, 1, RetryList);
-				RetryCount when is_integer(RetryCount) ->
-					%io:format("scheduling ~s for retry (~p of ~p)~n", [Host, RetryCount, Retries]),
-					NewHosts = Tail ++ [{Distance, Host}],
-					NewRetryList = lists:keydelete(Host, 1, RetryList) ++ [{Host, RetryCount + 1}];
-				_ when Retries == 0 ->
-					% done retrying completely
-					NewHosts = Tail,
-					NewRetryList = lists:keydelete(Host, 1, RetryList);
-				_ ->
-					% otherwise...
-					%io:format("scheduling ~s for retry (~p of ~p)~n", [Host, 1, Retries]),
-					NewHosts = Tail ++ [{Distance, Host}],
-					NewRetryList = lists:keydelete(Host, 1, RetryList) ++ [{Host, 1}]
-			end,
-			case NewHosts of
-				[] ->
-					{error, retries_exceeded, {FailureType, Host, Message}};
-				_ ->
-					try_smtp_sessions(NewHosts, Email, Options, NewRetryList)
-			end
+		throw:FailMsg ->
+			handle_smtp_throw(FailMsg, Hosts, Email, Options, RetryList)
 	end.
+
+handle_smtp_throw({permanent_failure, Message}, [{_Distance, Host} | _Tail], _Email, _Options, _RetryList) ->
+	% permanent failure means no retries, and don't even continue with other hosts
+	{error, no_more_hosts, {permanent_failure, Host, Message}};
+handle_smtp_throw({temporary_failure, tls_failed}, [{_Distance, Host} | _Tail] = Hosts, Email, Options, RetryList) ->
+	% Could not start the TLS handshake; if tls is optional then try without TLS
+	case proplists:get_value(tls, Options) of
+		if_available ->
+			NoTLSOptions = [{tls,never} | proplists:delete(tls, Options)],
+			try do_smtp_session(Host, Email, NoTLSOptions) of
+				Res -> Res
+			catch
+				throw:FailMsg ->
+					handle_smtp_throw(FailMsg, Hosts, Email, Options, RetryList)
+			end;
+		_ ->
+			try_next_host({temporary_failure, tls_failed}, Hosts, Email, Options, RetryList)
+	end;
+handle_smtp_throw(FailMsg, Hosts, Email, Options, RetryList) ->
+	try_next_host(FailMsg, Hosts, Email, Options, RetryList).
+
+try_next_host({FailureType, Message}, [{_Distance, Host} | _Tail] = Hosts, Email, Options, RetryList) ->
+	Retries = proplists:get_value(retries, Options),
+	RetryCount = proplists:get_value(Host, RetryList),
+	case fetch_next_host(Retries, RetryCount, Hosts, RetryList) of
+		{[], _NewRetryList} ->
+			{error, retries_exceeded, {FailureType, Host, Message}};
+		{NewHosts, NewRetryList} ->
+			try_smtp_sessions(NewHosts, Email, Options, NewRetryList)
+	end.
+
+fetch_next_host(Retries, RetryCount, [{_Distance, Host} | Tail], RetryList) when is_integer(RetryCount), RetryCount >= Retries ->
+	% out of chances
+	%io:format("retries for ~s exceeded (~p of ~p)~n", [Host, RetryCount, Retries]),
+	{Tail, lists:keydelete(Host, 1, RetryList)};
+fetch_next_host(_Retries, RetryCount, [{Distance, Host} | Tail], RetryList) when is_integer(RetryCount) ->
+	%io:format("scheduling ~s for retry (~p of ~p)~n", [Host, RetryCount, Retries]),
+	{Tail ++ [{Distance, Host}], lists:keydelete(Host, 1, RetryList) ++ [{Host, RetryCount + 1}]};
+fetch_next_host(0, _RetryCount, [{_Distance, Host} | Tail], RetryList) ->
+	% done retrying completely
+	{Tail, lists:keydelete(Host, 1, RetryList)};
+fetch_next_host(_Retries, _RetryCount, [{Distance, Host} | Tail], RetryList) ->
+	% otherwise...
+	%io:format("scheduling ~s for retry (~p of ~p)~n", [Host, 1, Retries]),
+	{Tail ++ [{Distance, Host}], lists:keydelete(Host, 1, RetryList) ++ [{Host, 1}]}.
+
 
 -spec do_smtp_session(Host :: string(), Email :: email(), Options :: list()) -> binary().
 do_smtp_session(Host, Email, Options) ->
@@ -247,7 +264,9 @@ try_DATA(Body, Socket, _Extensions) ->
 	socket:send(Socket, "DATA\r\n"),
 	case read_possible_multiline_reply(Socket) of
 		{ok, <<"354", _Rest/binary>>} ->
-			socket:send(Socket, [Body, "\r\n.\r\n"]),
+			%% Escape period at start of line (rfc5321 4.5.2)
+			EscapedBody = re:replace(Body, <<"^\\\.">>, <<"..">>, [global, multiline, {return, binary}]),
+			socket:send(Socket, [EscapedBody, "\r\n.\r\n"]),
 			case read_possible_multiline_reply(Socket) of
 				{ok, <<"250 ", Receipt/binary>>} ->
 					Receipt;
@@ -296,8 +315,9 @@ try_AUTH(Socket, Options, AuthTypes) ->
 					false
 			end;
 		true ->
-			Username = proplists:get_value(username, Options),
-			Password = proplists:get_value(password, Options),
+
+			Username = to_string(proplists:get_value(username, Options)),
+			Password = to_string(proplists:get_value(password, Options)),
 			%io:format("Auth types: ~p~n", [AuthTypes]),
 			Types = re:split(AuthTypes, " ", [{return, list}, trim]),
 			case do_AUTH(Socket, Username, Password, Types) of
@@ -313,6 +333,9 @@ try_AUTH(Socket, Options, AuthTypes) ->
 					true
 			end
 	end.
+
+to_string(String) when is_list(String)   -> String;
+to_string(Binary) when is_binary(Binary) -> binary_to_list(Binary).
 
 -spec do_AUTH(Socket :: socket:socket(), Username :: string(), Password :: string(), Types :: [string()]) -> boolean().
 do_AUTH(Socket, Username, Password, Types) ->
@@ -350,12 +373,14 @@ do_AUTH_each(Socket, Username, Password, ["CRAM-MD5" | Tail]) ->
 do_AUTH_each(Socket, Username, Password, ["LOGIN" | Tail]) ->
 	socket:send(Socket, "AUTH LOGIN\r\n"),
 	case read_possible_multiline_reply(Socket) of
-		{ok, <<"334 VXNlcm5hbWU6\r\n">>} ->
+		%% base64 Username: or username:
+		{ok, Prompt} when Prompt == <<"334 VXNlcm5hbWU6\r\n">>; Prompt == <<"334 dXNlcm5hbWU6\r\n">> ->
 			%io:format("username prompt~n"),
 			U = base64:encode(Username),
 			socket:send(Socket, [U,"\r\n"]),
 			case read_possible_multiline_reply(Socket) of
-				{ok, <<"334 UGFzc3dvcmQ6\r\n">>} ->
+				%% base64 Password: or password:
+				{ok, Prompt2} when Prompt2 == <<"334 UGFzc3dvcmQ6\r\n">>; Prompt2 == <<"334 cGFzc3dvcmQ6\r\n">> ->
 					%io:format("password prompt~n"),
 					P = base64:encode(Password),
 					socket:send(Socket, [P,"\r\n"]),
@@ -423,9 +448,9 @@ try_HELO(Socket, Options) ->
 % check if we should try to do TLS
 -spec try_STARTTLS(Socket :: socket:socket(), Options :: list(), Extensions :: list()) -> {socket:socket(), list()}.
 try_STARTTLS(Socket, Options, Extensions) ->
-		case {proplists:get_value(tls, Options),
-				proplists:get_value(<<"STARTTLS">>, Extensions)} of
-			{Atom, true} when Atom =:= always; Atom =:= if_available ->
+	case {proplists:get_value(tls, Options),
+			proplists:get_value(<<"STARTTLS">>, Extensions)} of
+		{Atom, true} when Atom =:= always; Atom =:= if_available ->
 			%io:format("Starting TLS~n"),
 			case {do_STARTTLS(Socket, Options), Atom} of
 				{false, always} ->
@@ -452,36 +477,42 @@ do_STARTTLS(Socket, Options) ->
 	socket:send(Socket, "STARTTLS\r\n"),
 	case read_possible_multiline_reply(Socket) of
 		{ok, <<"220", _Rest/binary>>} ->
-			application:start(crypto),
-			application:start(public_key),
-			application:start(ssl),
-			case socket:to_ssl_client(Socket, [], 5000) of
+			case catch socket:to_ssl_client(Socket, [], 5000) of
 				{ok, NewSocket} ->
 					%NewSocket;
 					{ok, Extensions} = try_EHLO(NewSocket, Options),
 					{NewSocket, Extensions};
+				{'EXIT', Reason} ->
+					quit(Socket),
+					error_logger:error_msg("Error in ssl upgrade: ~p.~n", [Reason]),
+					erlang:throw({temporary_failure, tls_failed});
+				{error, ssl_not_started} ->
+					quit(Socket),
+					error_logger:error_msg("SSL not started.~n"),
+					erlang:throw({permanent_failure, ssl_not_started});
 				_Else ->
 					%io:format("~p~n", [Else]),
 					false
 			end;
 		{ok, <<"4", _Rest/binary>> = Msg} ->
 			quit(Socket),
-			throw({temporary_failure, Msg});
+			erlang:throw({temporary_failure, Msg});
 		{ok, Msg} ->
 			quit(Socket),
-			throw({permanent_failure, Msg})
+			erlang:throw({permanent_failure, Msg})
 	end.
 
 %% try connecting to a host
 connect(Host, Options) when is_binary(Host) ->
 	connect(binary_to_list(Host), Options);
 connect(Host, Options) ->
-	SockOpts = [binary, {packet, line}, {keepalive, true}, {active, false}],
+	AddSockOpts = case proplists:get_value(sockopts, Options) of
+		undefined -> [];
+		Other -> Other
+	end,
+    SockOpts = [binary, {packet, line}, {keepalive, true}, {active, false} | AddSockOpts],
 	Proto = case proplists:get_value(ssl, Options) of
 		true ->
-			application:start(crypto),
-			application:start(public_key),
-			application:start(ssl),
 			ssl;
 		_ ->
 			tcp
@@ -695,7 +726,7 @@ session_start_test_() ->
 								?assertMatch({ok, "EHLO testing\r\n"}, socket:recv(X, 0, 1000)),
 								socket:send(X, "250-server.example.com EHLO\r\n250-AUTH LOGIN PLAIN\r\n421 too busy\r\n"),
 								?assertMatch({ok, "QUIT\r\n"}, socket:recv(X, 0, 1000)),
-								
+
 								{ok, Y} = socket:accept(ListenSock, 1000),
 								socket:send(Y, "220 Some banner\r\n"),
 								?assertMatch({ok, "EHLO testing\r\n"}, socket:recv(Y, 0, 1000)),
@@ -755,7 +786,30 @@ session_start_test_() ->
 					}
 			end,
 			fun({ListenSock}) ->
-					{"a valid complete transaction with binary arguments shoyld succeed",
+					{"a valid complete transaction exercising period escaping",
+						fun() ->
+								Options = [{relay, "localhost"}, {port, 9876}, {hostname, "testing"}],
+								{ok, _Pid} = send({"test@foo.com", ["foo@bar.com"], ".hello world"}, Options),
+								{ok, X} = socket:accept(ListenSock, 1000),
+								socket:send(X, "220 Some banner\r\n"),
+								?assertMatch({ok, "EHLO testing\r\n"}, socket:recv(X, 0, 1000)),
+								socket:send(X, "250 hostname\r\n"),
+								?assertMatch({ok, "MAIL FROM: <test@foo.com>\r\n"}, socket:recv(X, 0, 1000)),
+								socket:send(X, "250 ok\r\n"),
+								?assertMatch({ok, "RCPT TO: <foo@bar.com>\r\n"}, socket:recv(X, 0, 1000)),
+								socket:send(X, "250 ok\r\n"),
+								?assertMatch({ok, "DATA\r\n"}, socket:recv(X, 0, 1000)),
+								socket:send(X, "354 ok\r\n"),
+								?assertMatch({ok, "..hello world\r\n"}, socket:recv(X, 0, 1000)),
+								?assertMatch({ok, ".\r\n"}, socket:recv(X, 0, 1000)),
+								socket:send(X, "250 ok\r\n"),
+								?assertMatch({ok, "QUIT\r\n"}, socket:recv(X, 0, 1000)),
+								ok
+						end
+					}
+			end,
+			fun({ListenSock}) ->
+					{"a valid complete transaction with binary arguments should succeed",
 						fun() ->
 								Options = [{relay, "localhost"}, {port, 9876}, {hostname, "testing"}],
 								{ok, _Pid} = send({<<"test@foo.com">>, [<<"foo@bar.com">>], <<"hello world">>}, Options),
@@ -787,11 +841,9 @@ session_start_test_() ->
 								?assertMatch({ok, "EHLO testing\r\n"}, socket:recv(X, 0, 1000)),
 								socket:send(X, "250-hostname\r\n250 STARTTLS\r\n"),
 								?assertMatch({ok, "STARTTLS\r\n"}, socket:recv(X, 0, 1000)),
-								application:start(crypto),
-								application:start(public_key),
-								application:start(ssl),
+								gen_smtp_application:ensure_all_started(gen_smtp),
 								socket:send(X, "220 ok\r\n"),
-								{ok, Y} = socket:to_ssl_server(X, [{certfile, "../testdata/server.crt"}, {keyfile, "../testdata/server.key"}], 5000),
+								{ok, Y} = socket:to_ssl_server(X, [{certfile, "test/fixtures/server.crt"}, {keyfile, "test/fixtures/server.key"}], 5000),
 								?assertMatch({ok, "EHLO testing\r\n"}, socket:recv(Y, 0, 1000)),
 								socket:send(Y, "250-hostname\r\n250 STARTTLS\r\n"),
 								?assertMatch({ok, "MAIL FROM: <test@foo.com>\r\n"}, socket:recv(Y, 0, 1000)),
@@ -818,11 +870,9 @@ session_start_test_() ->
 								?assertMatch({ok, "EHLO testing\r\n"}, socket:recv(X, 0, 1000)),
 								socket:send(X, "250-hostname\r\n250 STARTTLS\r\n"),
 								?assertMatch({ok, "STARTTLS\r\n"}, socket:recv(X, 0, 1000)),
-								application:start(crypto),
-								application:start(public_key),
-								application:start(ssl),
+								gen_smtp_application:ensure_all_started(gen_smtp),
 								socket:send(X, "220 ok\r\n"),
-								{ok, Y} = socket:to_ssl_server(X, [{certfile, "../testdata/server.crt"}, {keyfile, "../testdata/server.key"}], 5000),
+								{ok, Y} = socket:to_ssl_server(X, [{certfile, "test/fixtures/server.crt"}, {keyfile, "test/fixtures/server.key"}], 5000),
 								?assertMatch({ok, "EHLO testing\r\n"}, socket:recv(Y, 0, 1000)),
 								socket:send(Y, "250-hostname\r\n250 STARTTLS\r\n"),
 								?assertMatch({ok, "MAIL FROM: <test@foo.com>\r\n"}, socket:recv(Y, 0, 1000)),
@@ -872,6 +922,28 @@ session_start_test_() ->
 								UserString = binary_to_list(base64:encode("user")),
 								?assertEqual({ok, UserString++"\r\n"}, socket:recv(X, 0, 1000)),
 								socket:send(X, "334 UGFzc3dvcmQ6\r\n"),
+								PassString = binary_to_list(base64:encode("pass")),
+								?assertEqual({ok, PassString++"\r\n"}, socket:recv(X, 0, 1000)),
+								socket:send(X, "235 ok\r\n"),
+								?assertMatch({ok, "MAIL FROM: <test@foo.com>\r\n"}, socket:recv(X, 0, 1000)),
+								ok
+						end
+					}
+			end,
+			fun({ListenSock}) ->
+					{"AUTH LOGIN should work with lowercase prompts",
+						fun() ->
+								Options = [{relay, "localhost"}, {port, 9876}, {hostname, "testing"}, {username, "user"}, {password, "pass"}],
+								{ok, _Pid} = send({"test@foo.com", ["foo@bar.com"], "hello world"}, Options),
+								{ok, X} = socket:accept(ListenSock, 1000),
+								socket:send(X, "220 Some banner\r\n"),
+								?assertMatch({ok, "EHLO testing\r\n"}, socket:recv(X, 0, 1000)),
+								socket:send(X, "250-hostname\r\n250 AUTH LOGIN\r\n"),
+								?assertEqual({ok, "AUTH LOGIN\r\n"}, socket:recv(X, 0, 1000)),
+								socket:send(X, "334 dXNlcm5hbWU6\r\n"),
+								UserString = binary_to_list(base64:encode("user")),
+								?assertEqual({ok, UserString++"\r\n"}, socket:recv(X, 0, 1000)),
+								socket:send(X, "334 cGFzc3dvcmQ6\r\n"),
 								PassString = binary_to_list(base64:encode("pass")),
 								?assertEqual({ok, PassString++"\r\n"}, socket:recv(X, 0, 1000)),
 								socket:send(X, "235 ok\r\n"),
@@ -965,10 +1037,8 @@ session_start_test_() ->
 			fun({_ListenSock}) ->
 					{"Connecting to a SSL socket directly should work",
 						fun() ->
-								application:start(crypto),
-								application:start(public_key),
-								application:start(ssl),
-								{ok, ListenSock} = socket:listen(ssl, 9877, [{certfile, "../testdata/server.crt"}, {keyfile, "../testdata/server.key"}]),
+								gen_smtp_application:ensure_all_started(gen_smtp),
+								{ok, ListenSock} = socket:listen(ssl, 9877, [{certfile, "test/fixtures/server.crt"}, {keyfile, "test/fixtures/server.key"}]),
 								Options = [{relay, <<"localhost">>}, {port, 9877}, {hostname, <<"testing">>}, {ssl, true}],
 								{ok, _Pid} = send({<<"test@foo.com">>, [<<"<foo@bar.com>">>, <<"baz@bar.com">>], <<"hello world">>}, Options),
 								{ok, X} = socket:accept(ListenSock, 1000),

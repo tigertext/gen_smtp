@@ -131,7 +131,7 @@ handle_DATA(_From, _To, <<>>, State) ->
 	{error, "552 Message too small", State};
 handle_DATA(From, To, Data, State) ->
 	% some kind of unique id
-	Reference = lists:flatten([io_lib:format("~2.16.0b", [X]) || <<X>> <= erlang:md5(term_to_binary(erlang:now()))]),
+    Reference = lists:flatten([io_lib:format("~2.16.0b", [X]) || <<X>> <= erlang:md5(term_to_binary(unique_id()))]),
 	% if RELAY is true, then relay email to email address, else send email data to console
 	case proplists:get_value(relay, State#state.options, false) of
 		true -> relay(From, To, Data);
@@ -212,11 +212,19 @@ terminate(Reason, State) ->
 
 %%% Internal Functions %%%
 
+-ifdef(deprecated_now).
+unique_id() ->
+    erlang:unique_integer().
+-else.
+unique_id() ->
+    erlang:now().
+-endif.
+
+-spec relay(binary(), [binary()], binary()) -> ok.
 relay(_, [], _) ->
 	ok;
 relay(From, [To|Rest], Data) ->
 	% relay message to email address
-	[_User, Host] = string:tokens(To, "@"),
+	[_User, Host] = string:tokens(binary_to_list(To), "@"),
 	gen_smtp_client:send({From, [To], erlang:binary_to_list(Data)}, [{relay, Host}]),
 	relay(From, Rest, Data).
-
