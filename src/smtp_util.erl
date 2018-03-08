@@ -59,18 +59,18 @@ guess_FQDN() ->
 	FQDN.
 
 %% @doc Compute the CRAM digest of `Key' and `Data'
--spec(compute_cram_digest/2 :: (Key :: binary(), Data :: string()) -> binary()).
+-spec compute_cram_digest(Key :: binary(), Data :: string()) -> binary().
 compute_cram_digest(Key, Data) ->
-	Bin = crypto:md5_mac(Key, Data),
+	Bin = crypto:hmac(md5, Key, Data),
 	list_to_binary([io_lib:format("~2.16.0b", [X]) || <<X>> <= Bin]).
 
 %% @doc Generate a seed string for CRAM.
--spec(get_cram_string/1 :: (Hostname :: string()) -> string()).
+-spec get_cram_string(Hostname :: string()) -> string().
 get_cram_string(Hostname) ->
-	binary_to_list(base64:encode(lists:flatten(io_lib:format("<~B.~B@~s>", [crypto:rand_uniform(0, 4294967295), crypto:rand_uniform(0, 4294967295), Hostname])))).
+	binary_to_list(base64:encode(lists:flatten(io_lib:format("<~B.~B@~s>", [rand:uniform(4294967295), rand:uniform(4294967295), Hostname])))).
 
 %% @doc Trim \r\n from `String'
--spec(trim_crlf/1 :: (String :: string()) -> string()).
+-spec trim_crlf(String :: string()) -> string().
 trim_crlf(String) ->
 	string:strip(string:strip(String, right, $\n), right, $\r).
 
@@ -103,20 +103,20 @@ zone(Val) when Val >= 0 ->
 %% @doc Generate a unique message ID 
 generate_message_id() ->
 	FQDN = guess_FQDN(),
-	Md5 = [io_lib:format("~2.16.0b", [X]) || <<X>> <= erlang:md5(term_to_binary([erlang:now(), FQDN]))],
+	Md5 = [io_lib:format("~2.16.0b", [X]) || <<X>> <= erlang:md5(term_to_binary([erlang:timestamp(), FQDN]))],
 	io_lib:format("<~s@~s>", [Md5, FQDN]).
 
 %% @doc Generate a unique MIME message boundary
 generate_message_boundary() ->
 	FQDN = guess_FQDN(),
-	["_=", [io_lib:format("~2.36.0b", [X]) || <<X>> <= erlang:md5(term_to_binary([erlang:now(), FQDN]))], "=_"].
+	["_=", [io_lib:format("~2.36.0b", [X]) || <<X>> <= erlang:md5(term_to_binary([erlang:timestamp(), FQDN]))], "=_"].
 
 get_source_ip_from_proxy(Params) ->
     Tokens = binstr:split(Params, <<" ">>),
     Len = length(Tokens),
     case Len > 1 of 
         false -> undefined;
-        true -> [Protocol|Other_Params] = Tokens,
+        true -> [Protocol|_Other_Params] = Tokens,
                 case Protocol of
                     <<"TCP4">> -> get_source_from_proxy_command(Tokens, Len); 
                     <<"TCP6">> -> get_source_from_proxy_command(Tokens, Len);
@@ -124,8 +124,8 @@ get_source_ip_from_proxy(Params) ->
                 end
    end.
 
-get_source_from_proxy_command(Tokens, Len) when Len < 2 -> undefined;
-get_source_from_proxy_command(Tokens, Len) ->
+get_source_from_proxy_command(_Tokens, Len) when Len < 2 -> undefined;
+get_source_from_proxy_command(Tokens, _Len) ->
     [_Protocol, S_IP|_] = Tokens,
     case inet:parse_address(binary_to_list(S_IP)) of
         {ok, Result} -> Result;
