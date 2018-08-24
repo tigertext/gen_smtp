@@ -613,8 +613,13 @@ handle_request({<<"STARTTLS">>, <<>>}, #state{socket = Socket, module = Module, 
 				KeyFile ->
 					[{keyfile, KeyFile} | Options1]
 			end,
-			% TODO: certfile and keyfile should be at configurable locations
-			case socket:to_ssl_server(Socket, Options2, 5000) of
+			Options3 = case proplists:get_value(cacertfile, Options) of
+						   undefined ->
+							   Options2;
+						   CACertFile ->
+							   [{cacertfile, CACertFile} | Options2]
+					   end,
+			case socket:to_ssl_server(Socket, Options3, 5000) of
 				{ok, NewSocket} ->
 					%io:format("SSL negotiation sucessful~n"),
 					{ok, State#state{socket = NewSocket, envelope=undefined,
