@@ -36,6 +36,7 @@
 -define(SSL_LISTEN_OPTIONS, [ {active, false},
                               {backlog, 30},
                               {certfile, "server.crt"},
+                              {cacertfile, ""},
                               {depth, 0},
                               {keepalive, true},
                               {keyfile, "server.key"},
