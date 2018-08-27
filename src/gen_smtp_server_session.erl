@@ -92,8 +92,12 @@
     {'ok', string(), state()} | {'error', string(), state()}.
 -callback handle_other(Verb :: binary(), Args :: binary(), state()) ->
                           {string() | 'noreply', state()}.
+-callback handle_info(Info :: term(), State :: term()) ->
+    {noreply, NewState :: term()} |
+    {noreply, NewState :: term(), timeout() | hibernate} |
+    {stop, Reason :: term(), NewState :: term()}.
 
-
+-optional_callbacks([handle_info/2]).
 
 %% @doc Start a SMTP session linked to the calling process.
 %% @see start/3
@@ -113,8 +117,16 @@ start(Socket, Module, Options) ->
 %% @private
 -spec init(Args :: list()) -> {'ok', #state{}, ?TIMEOUT} | {'stop', any()} | 'ignore'.
 init([Socket, Module, Options]) ->
-	{ok, {PeerName, _Port}} = socket:peername(Socket),
-	case Module:init(proplists:get_value(hostname, Options, smtp_util:guess_FQDN()), proplists:get_value(sessioncount, Options, 0), PeerName, proplists:get_value(callbackoptions, Options, [])) of
+	PeerName = case socket:peername(Socket) of
+		{ok, {IPaddr, _Port}} -> IPaddr;
+		{'error', _} -> 'error'
+	end,
+	case PeerName =/= 'error'
+		andalso Module:init(proplists:get_value(hostname, Options, smtp_util:guess_FQDN()), proplists:get_value(sessioncount, Options, 0), PeerName, proplists:get_value(callbackoptions, Options, []))
+	of
+		false ->
+			socket:close(Socket),
+			ignore;
 		{ok, Banner, CallbackState} ->
 			socket:send(Socket, ["220 ", Banner, "\r\n"]),
 			socket:active_once(Socket),
@@ -192,7 +204,7 @@ handle_info({receive_data, Body, Rest}, #state{socket = Socket, readmessage = tr
 			% might not even be able to get here anymore...
 			{noreply, State#state{readmessage = false, envelope = #envelope{}}, ?TIMEOUT}
 	end;
-handle_info({_SocketType, Socket, Packet}, State) ->
+handle_info({SocketType, Socket, Packet}, State) when SocketType =:= 'tcp'; SocketType =:= 'ssl' ->
 	case handle_request(parse_request(Packet), State) of
 		{ok,  #state{extensions = Extensions,  options = Options, readmessage = true} = NewState} ->
 			MaxSize = case has_extension(Extensions, "SIZE") of
@@ -222,9 +234,20 @@ handle_info(timeout, #state{socket = Socket} = State) ->
 	socket:send(Socket, "421 Error: timeout exceeded\r\n"),
 	socket:close(Socket),
 	{stop, normal, State};
-handle_info(Info, State) ->
-	io:format("unhandled info message ~p~n", [Info]),
-	{noreply, State}.
+handle_info(Info, #state{module=Module, callbackstate = OldCallbackState} = State) ->
+	case erlang:function_exported(Module, handle_info, 2) of
+		true ->
+			case Module:handle_info(Info, OldCallbackState) of
+				{noreply, NewCallbackState} ->
+					{noreply, State#state{callbackstate = NewCallbackState}};
+				{noreply, NewCallbackState, Action} ->
+					{noreply, State#state{callbackstate = NewCallbackState}, Action};
+				{stop, Reason, NewCallbackState} ->
+					{stop, Reason, State#state{callbackstate = NewCallbackState}}
+			end;
+		false ->
+			{noreply, State}
+	end.
 
 %% @hidden
 -spec terminate(Reason :: any(), State :: #state{}) -> 'ok'.
@@ -596,8 +619,13 @@ handle_request({<<"STARTTLS">>, <<>>}, #state{socket = Socket, module = Module, 
 				KeyFile ->
 					[{keyfile, KeyFile} | Options1]
 			end,
-			% TODO: certfile and keyfile should be at configurable locations
-			case socket:to_ssl_server(Socket, Options2, 5000) of
+			Options3 = case proplists:get_value(cacertfile, Options) of
+						   undefined ->
+							   Options2;
+						   CACertFile ->
+							   [{cacertfile, CACertFile} | Options2]
+					   end,
+			case socket:to_ssl_server(Socket, Options3, 5000) of
 				{ok, NewSocket} ->
 					%io:format("SSL negotiation sucessful~n"),
 					{ok, State#state{socket = NewSocket, envelope=undefined,
@@ -2206,7 +2234,7 @@ stray_newline_test_() ->
 					?assertEqual(<<"fo\r\no\r\n\r">>, check_bare_crlf(<<"fo\ro\n\r">>, <<>>, fix, 0)),
 					?assertEqual(<<"foo\r\n">>, check_bare_crlf(<<"foo\r\n">>, <<>>, fix, 0))
 			end
-		},	
+		},
 		{"Stripping them should work",
 			fun() ->
 					?assertEqual(<<"foo">>, check_bare_crlf(<<"foo">>, <<>>, strip, 0)),
