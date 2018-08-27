@@ -28,6 +28,7 @@
 		trim_crlf/1, rfc5322_timestamp/0, zone/0, generate_message_id/0,
          parse_rfc822_addresses/1,
          combine_rfc822_addresses/1,
+         get_source_ip_from_proxy/1,
          generate_message_boundary/0]).
 
 %% @doc returns a sorted list of mx servers for `Domain', lowest distance first
@@ -180,6 +181,27 @@ is_special($]) -> true;
 is_special($') -> true; % special for some smtp servers
 is_special(_) -> false.
 
+
+get_source_ip_from_proxy(Params) ->
+    Tokens = binstr:split(Params, <<" ">>),
+    Len = length(Tokens),
+    case Len > 1 of 
+        false -> undefined;
+        true -> [Protocol|Other_Params] = Tokens,
+                case Protocol of
+                    <<"TCP4">> -> get_source_from_proxy_command(Tokens, Len); 
+                    <<"TCP6">> -> get_source_from_proxy_command(Tokens, Len);
+                    _ -> undefined
+                end
+   end.
+
+get_source_from_proxy_command(Tokens, Len) when Len < 2 -> undefined;
+get_source_from_proxy_command(Tokens, Len) ->
+    [_Protocol, S_IP|_] = Tokens,
+    case inet:parse_address(binary_to_list(S_IP)) of
+        {ok, Result} -> Result;
+        _ -> undefined
+    end.
 
 parse_rfc822_addresses(B) when is_binary(B) ->
 	parse_rfc822_addresses(binary_to_list(B));

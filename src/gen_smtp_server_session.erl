@@ -271,7 +271,6 @@ parse_request(Packet) ->
 	Request = binstr:strip(binstr:strip(binstr:strip(binstr:strip(Packet, right, $\n), right, $\r), right, $\s), left, $\s),
 	case binstr:strchr(Request, $\s) of
 		0 ->
-			% io:format("got a ~s request~n", [Request]),
 			case binstr:to_upper(Request) of
 				<<"QUIT">> = Res -> {Res, <<>>};
 				<<"DATA">> = Res -> {Res, <<>>};
@@ -281,7 +280,6 @@ parse_request(Packet) ->
 		Index ->
 			Verb = binstr:substr(Request, 1, Index - 1),
 			Parameters = binstr:strip(binstr:substr(Request, Index + 1), left, $\s),
-			%io:format("got a ~s request with parameters ~s~n", [Verb, Parameters]),
 			{binstr:to_upper(Verb), Parameters}
 	end.
 
@@ -289,6 +287,14 @@ parse_request(Packet) ->
 handle_request({<<>>, _Any}, #state{socket = Socket} = State) ->
 	socket:send(Socket, "500 Error: bad syntax\r\n"),
 	{ok, State};
+handle_request({<<"PROXY">>, Params}, #state{module = Module, callbackstate = OldCallbackState} = State) ->
+  New_State = case smtp_util:get_source_ip_from_proxy(Params) of
+      undefined -> State;
+      Ip -> %% save for mail session
+          {ok, CallbackState} = Module:update_source_ip(Ip, OldCallbackState),
+          State#state{callbackstate = CallbackState}
+  end,
+	{ok, New_State};
 handle_request({<<"HELO">>, <<>>}, #state{socket = Socket} = State) ->
 	socket:send(Socket, "501 Syntax: HELO hostname\r\n"),
 	{ok, State};
@@ -384,7 +390,6 @@ handle_request({<<"AUTH">>, Args}, #state{socket = Socket, extensions = Extensio
 							socket:send(Socket, "334\r\n"),
 							{ok, State#state{waitingauth = 'plain', envelope = Envelope#envelope{auth = {<<>>, <<>>}}}};
 						<<"CRAM-MD5">> ->
-							crypto:start(), % ensure crypto is started, we're gonna need it
 							String = smtp_util:get_cram_string(proplists:get_value(hostname, Options, smtp_util:guess_FQDN())),
 							socket:send(Socket, ["334 ", String, "\r\n"]),
 							{ok, State#state{waitingauth = 'cram-md5', authdata=base64:decode(String), envelope = Envelope#envelope{auth = {<<>>, <<>>}}}}
@@ -601,6 +606,7 @@ handle_request({<<"STARTTLS">>, <<>>}, #state{socket = Socket, module = Module, 
 	case has_extension(Extensions, "STARTTLS") of
 		{true, _} ->
 			socket:send(Socket, "220 OK\r\n"),
+			application:start(public_key),
 			Options1 = case proplists:get_value(certfile, Options) of
 				undefined ->
 					[];
