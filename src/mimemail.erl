@@ -754,15 +754,10 @@ encode_header_value(H, Value) when H =:= <<"To">>; H =:= <<"Cc">>; H =:= <<"Bcc"
 	{ok, Addresses} = smtp_util:parse_rfc822_addresses(Value),
 	{Names, Emails} = lists:unzip(Addresses),
 	NewNames = lists:map(fun rfc2047_utf8_encode/1, Names),
-  Quoted_Names = [quote_name(H, Name) || Name <- NewNames],
-	smtp_util:combine_rfc822_addresses(lists:zip(Quoted_Names, Emails));
+	smtp_util:combine_rfc822_addresses(lists:zip(NewNames, Emails));
 
 encode_header_value(_, Value) ->
 	rfc2047_utf8_encode(Value).
-
-quote_name(<<"From">>, Name) ->
-  "\"" ++ Name ++ "\"";
-quote_name(_, Name) -> Name.
 
 encode_component(_Type, _SubType, Headers, Params, Body) ->
 	if

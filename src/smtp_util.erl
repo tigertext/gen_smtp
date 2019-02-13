@@ -136,7 +136,8 @@ combine_rfc822_addresses([{Name, Email}|Rest], Acc) ->
 
 opt_quoted(N)  ->
 	case re:run(N, "\"") of
-		nomatch -> N;
+		nomatch ->
+			[$", N, $"];
 		{match, _} ->
 			[$", re:replace(N, "\"", "\\\\\"", [global]), $"]
 	end.
