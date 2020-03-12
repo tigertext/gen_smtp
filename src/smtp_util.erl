@@ -69,7 +69,7 @@ compute_cram_digest(Key, Data) ->
 %% @doc Generate a seed string for CRAM.
 -spec get_cram_string(Hostname :: string()) -> string().
 get_cram_string(Hostname) ->
-	binary_to_list(base64:encode(lists:flatten(io_lib:format("<~B.~B@~s>", [crypto:rand_uniform(0, 4294967295), crypto:rand_uniform(0, 4294967295), Hostname])))).
+	binary_to_list(base64:encode(lists:flatten(io_lib:format("<~B.~B@~s>", [rand:uniform(4294967295), rand:uniform(4294967295), Hostname])))).
 
 %% @doc Trim \r\n from `String'
 -spec trim_crlf(String :: string()) -> string().
@@ -147,7 +147,7 @@ get_source_ip_from_proxy(Params) ->
     Len = length(Tokens),
     case Len > 1 of 
         false -> undefined;
-        true -> [Protocol|Other_Params] = Tokens,
+        true -> [Protocol|_Other_Params] = Tokens,
                 case Protocol of
                     <<"TCP4">> -> get_source_from_proxy_command(Tokens, Len); 
                     <<"TCP6">> -> get_source_from_proxy_command(Tokens, Len);
@@ -155,8 +155,8 @@ get_source_ip_from_proxy(Params) ->
                 end
    end.
 
-get_source_from_proxy_command(Tokens, Len) when Len < 2 -> undefined;
-get_source_from_proxy_command(Tokens, Len) ->
+get_source_from_proxy_command(_Tokens, Len) when Len < 2 -> undefined;
+get_source_from_proxy_command(Tokens, _Len) ->
     [_Protocol, S_IP|_] = Tokens,
     case inet:parse_address(binary_to_list(S_IP)) of
         {ok, Result} -> Result;
