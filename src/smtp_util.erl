@@ -26,7 +26,7 @@
 -export([
 		mxlookup/1, guess_FQDN/0, compute_cram_digest/2, get_cram_string/1,
 		trim_crlf/1, rfc5322_timestamp/0, zone/0, generate_message_id/0,
-         parse_rfc822_addresses/1,
+         parse_rfc822_addresses/1, get_source_ip_from_proxy/1, 
          combine_rfc822_addresses/1,
          generate_message_boundary/0]).
 
@@ -155,6 +155,28 @@ combine_rfc822_addresses([{<<>>, Email}|Rest], Acc) ->
 combine_rfc822_addresses([{Name, Email}|Rest], Acc) ->
 	Quoted = [ opt_quoted(Name)," <", Email, ">" ],
 	combine_rfc822_addresses(Rest, [32, $,, Quoted|Acc]).
+
+get_source_ip_from_proxy(Params) ->
+    Tokens = binstr:split(Params, <<" ">>),
+    Len = length(Tokens),
+    case Len > 1 of 
+        false -> undefined;
+        true -> [Protocol| _Other_Params] = Tokens,
+                case Protocol of
+                    <<"TCP4">> -> get_source_from_proxy_command(Tokens, Len); 
+                    <<"TCP6">> -> get_source_from_proxy_command(Tokens, Len);
+                    _ -> undefined
+                end
+   end.
+
+get_source_from_proxy_command(_Tokens, Len) when Len < 2 -> undefined;
+get_source_from_proxy_command(Tokens, _Len) ->
+    [_Protocol, S_IP|_] = Tokens,
+    case inet:parse_address(binary_to_list(S_IP)) of
+        {ok, Result} -> Result;
+        _ -> undefined
+    end.
+
 
 opt_quoted(B) when is_binary(B) ->
 	opt_quoted(binary_to_list(B));
