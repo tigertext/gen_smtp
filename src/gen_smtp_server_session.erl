@@ -319,6 +319,14 @@ parse_request(Packet) ->
 handle_request({<<>>, _Any}, State) ->
 	send(State, "500 Error: bad syntax\r\n"),
 	{ok, State};
+handle_request({<<"PROXY">>, Params}, #state{module = Module, callbackstate = OldCallbackState} = State) ->
+  New_State = case smtp_util:get_source_ip_from_proxy(Params) of
+      undefined -> State;
+      Ip -> %% save for mail session
+          {ok, CallbackState} = Module:update_source_ip(Ip, OldCallbackState),
+          State#state{callbackstate = CallbackState}
+  end,
+	{ok, New_State};
 handle_request({<<"HELO">>, <<>>}, State) ->
 	send(State, "501 Syntax: HELO hostname\r\n"),
 	{ok, State};
@@ -430,7 +438,6 @@ handle_request({<<"AUTH">>, Args}, #state{extensions = Extensions, envelope = En
 							send(State, "334\r\n"),
 							{ok, State#state{waitingauth = 'plain', envelope = Envelope#envelope{auth = {<<>>, <<>>}}}};
 						<<"CRAM-MD5">> ->
-							crypto:start(), % ensure crypto is started, we're gonna need it
 							String = smtp_util:get_cram_string(hostname(Options)),
 							send(State, ["334 ", String, "\r\n"]),
 							{ok, State#state{waitingauth = 'cram-md5', authdata=base64:decode(String), envelope = Envelope#envelope{auth = {<<>>, <<>>}}}}
