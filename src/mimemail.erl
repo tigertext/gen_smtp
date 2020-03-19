@@ -982,7 +982,7 @@ rfc2047_utf8_encode([C|T], Acc, WordLen, Char) when C > 192 andalso C =< 247 ->
     UTFBytes = utf_char_bytes(C),
     {Rest, ExtraUTFBytes} = encode_extra_utf_bytes(UTFBytes-1, T),
     rfc2047_utf8_encode(Rest, Char ++ Acc, WordLen+length(Char), ExtraUTFBytes ++ encode_byte(C));
-rfc2047_utf8_encode([C|T], Acc, WordLen, Char) when C =:= 10 ->
+rfc2047_utf8_encode([C|T], Acc, WordLen, Char) when C =:= $\n ->
 	rfc2047_utf8_encode(T, Char ++ Acc, WordLen+length(Char), encode_byte(C)).
 
 is_ascii_printable([]) -> 'true';
