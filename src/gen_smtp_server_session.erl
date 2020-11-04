@@ -45,7 +45,9 @@
 %% gen_server callbacks
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2,
 		code_change/3]).
--export_type([options/0]).
+-export_type([options/0, error_class/0]).
+
+-include_lib("hut/include/hut.hrl").
 
 -record(envelope,
 	{
@@ -75,14 +77,38 @@
 		options = [] :: [tuple()]
 	}
 ).
+
+%% OTP-18: ssl:ssloption() (not exported)
+%% OTP-19: ssl:ssl_option()
+%% OTP-20: ssl:ssl_option()
+%% OTP-21: ssl:tls_server_option()
+%% OTP-22: ssl:tls_server_option()
+%% OTP-23: ssl:tls_server_option()
+-ifdef(OTP_RELEASE).
+-type tls_opt() :: ssl:tls_server_option().
+-else.
+ -ifdef(OTP_18).
+ -type tls_opt() :: tuple() | atom().
+ -else.
+ -type tls_opt() :: ssl:ssl_option().
+ -endif.
+-endif.
+
 -type options() :: [  {callbackoptions, any()}
-					| {certfile, file:name_all()}
-					| {keyfile, file:name_all()}
-					| {allow_bare_newlines, boolean() | fix | strip}
-					| {hostname, inet:hostname()}].
+					| {certfile, file:name_all()} % deprecated, see tls_options
+					| {keyfile, file:name_all()}  % deprecated, see tls_options
+					| {allow_bare_newlines, false | ignore | fix | strip}
+					| {hostname, inet:hostname()}
+					| {tls_options, [tls_opt()]}].
 
 -type(state() :: any()).
 -type(error_message() :: {error, string(), state()}).
+-type error_class() :: tcp_closed | tcp_error
+					 | ssl_closed | ssl_error
+					 | data_rejected
+					 | timeout
+					 | out_of_order
+					 | ssl_handshake_error.
 
 -callback init(Hostname :: inet:hostname(), _SessionCount,
 			   Peername :: inet:ip_address(), Opts :: any()) ->
@@ -92,6 +118,7 @@
     {ok, pos_integer() | 'infinity', state()} | {ok, state()} | error_message().
 -callback handle_EHLO(Hostname :: binary(), Extensions :: list(), State :: state()) ->
     {ok, list(), state()} | error_message().
+-callback handle_STARTTLS(state()) -> state().
 -callback handle_AUTH(AuthType :: login | plain | 'cram-md5', Username :: binary(),
 					  Credential :: binary() | {binary(), binary()}, State :: state()) ->
     {ok, state()} | any().
@@ -114,9 +141,10 @@
     {noreply, NewState :: state()} |
     {noreply, NewState :: state(), timeout() | hibernate} |
     {stop, Reason :: term(), NewState :: term()}.
+-callback handle_error(error_class(), any(), state()) -> {ok, state()} | {stop, Reason :: any(), state()}.
 -callback terminate(Reason :: any(), state()) -> {ok, Reason :: any(), state()}.
 
--optional_callbacks([handle_info/2, handle_AUTH/4]).
+-optional_callbacks([handle_info/2, handle_AUTH/4, handle_error/3]).
 
 %% @doc Start a SMTP session linked to the calling process.
 %% @see start/3
@@ -197,11 +225,13 @@ handle_cast(_Msg, State) ->
 handle_info({receive_data, {error, size_exceeded}}, #state{readmessage = true} = State) ->
 	send(State, "552 Message too large\r\n"),
 	setopts(State, [{active, once}]),
-	{noreply, State#state{readmessage = false, envelope = #envelope{}}, ?TIMEOUT};
+	State1 = handle_error(data_rejected, size_exceeded, State),
+	{noreply, State1#state{readmessage = false, envelope = #envelope{}}, ?TIMEOUT};
 handle_info({receive_data, {error, bare_newline}}, #state{readmessage = true} = State) ->
 	send(State, "451 Bare newline detected\r\n"),
 	setopts(State, [{active, once}]),
-	{noreply, State#state{readmessage = false, envelope = #envelope{}}, ?TIMEOUT};
+	State1 = handle_error(data_rejected, bare_neline, State),
+	{noreply, State1#state{readmessage = false, envelope = #envelope{}}, ?TIMEOUT};
 handle_info({receive_data, Body, Rest},
 			#state{socket = Socket, transport = Transport, readmessage = true, envelope = Env, module=Module,
 				   callbackstate = OldCallbackState, maxsize=MaxSize} = State) ->
@@ -255,14 +285,19 @@ handle_info({SocketType, Socket, Packet}, #state{socket = Socket, transport = Tr
 		{stop, Reason, NewState} ->
 			{stop, Reason, NewState}
 	end;
-handle_info({tcp_closed, _Socket}, State) ->
-	{stop, normal, State};
-handle_info({ssl_closed, _Socket}, State) ->
-	{stop, normal, State};
+handle_info({Kind, _Socket}, State) when Kind == tcp_closed;
+										 Kind == ssl_closed ->
+	State1 = handle_error(Kind, [], State),
+	{stop, normal, State1};
+handle_info({Kind, _Socket, Reason}, State) when Kind == ssl_error;
+												 Kind == tcp_error ->
+	State1 = handle_error(Kind, Reason, State),
+	{stop, normal, State1};
 handle_info(timeout, #state{socket = Socket, transport = Transport} = State) ->
 	send(State, "421 Error: timeout exceeded\r\n"),
 	Transport:close(Socket),
-	{stop, normal, State};
+	State1 = handle_error(timeout, [], State),
+	{stop, normal, State1};
 handle_info(Info, #state{module=Module, callbackstate = OldCallbackState} = State) ->
 	case erlang:function_exported(Module, handle_info, 2) of
 		true ->
@@ -275,7 +310,8 @@ handle_info(Info, #state{module=Module, callbackstate = OldCallbackState} = Stat
 					{stop, Reason, State#state{callbackstate = NewCallbackState}}
 			end;
 		false ->
-			{noreply, State}
+			?log(debug, "Ignored message ~p", [Info]),
+			{noreply, State, ?TIMEOUT}
 	end.
 
 %% @hidden
@@ -301,7 +337,7 @@ parse_request(Packet) ->
 	Request = binstr:strip(binstr:strip(binstr:strip(binstr:strip(Packet, right, $\n), right, $\r), right, $\s), left, $\s),
 	case binstr:strchr(Request, $\s) of
 		0 ->
-			% io:format("got a ~s request~n", [Request]),
+		    ?log(debug, "got a ~s request~n", [Request]),
 			case binstr:to_upper(Request) of
 				<<"QUIT">> = Res -> {Res, <<>>};
 				<<"DATA">> = Res -> {Res, <<>>};
@@ -311,7 +347,7 @@ parse_request(Packet) ->
 		Index ->
 			Verb = binstr:substr(Request, 1, Index - 1),
 			Parameters = binstr:strip(binstr:substr(Request, Index + 1), left, $\s),
-			%io:format("got a ~s request with parameters ~s~n", [Verb, Parameters]),
+			?log(debug, "got a ~s request with parameters ~s~n", [Verb, Parameters]),
 			{binstr:to_upper(Verb), Parameters}
 	end.
 
@@ -394,9 +430,10 @@ handle_request({<<"EHLO">>, Hostname},
 			{ok, State#state{callbackstate = CallbackState}}
 	end;
 
-handle_request({<<"AUTH">>, _Args}, #state{envelope = undefined} = State) ->
+handle_request({<<"AUTH">> = C, _Args}, #state{envelope = undefined} = State) ->
 	send(State, "503 Error: send EHLO first\r\n"),
-	{ok, State};
+	State1 = handle_error(out_of_order, C, State),
+	{ok, State1};
 handle_request({<<"AUTH">>, Args}, #state{extensions = Extensions, envelope = Envelope, options = Options} = State) ->
 	case binstr:strchr(Args, $\s) of
 		0 ->
@@ -488,9 +525,10 @@ handle_request({Password64, <<>>}, #state{waitingauth = 'login', envelope = #env
 	Password = base64:decode(Password64),
 	try_auth('login', Username, Password, State);
 
-handle_request({<<"MAIL">>, _Args}, #state{envelope = undefined} = State) ->
+handle_request({<<"MAIL">> = C, _Args}, #state{envelope = undefined} = State) ->
 	send(State, "503 Error: send HELO/EHLO first\r\n"),
-	{ok, State};
+	State1 = handle_error(out_of_order, C, State),
+	{ok, State1};
 handle_request({<<"MAIL">>, Args},
 			   #state{
 					module = Module, envelope = Envelope,
@@ -506,7 +544,7 @@ handle_request({<<"MAIL">>, Args},
 							send(State, "501 Bad sender address syntax\r\n"),
 							{ok, State};
 						{ParsedAddress, <<>>} ->
-							%io:format("From address ~s (parsed as ~s)~n", [Address, ParsedAddress]),
+							?log(debug, "From address ~s (parsed as ~s)~n", [Address, ParsedAddress]),
 							case Module:handle_MAIL(ParsedAddress, OldCallbackState) of
 								{ok, CallbackState} ->
 									send(State, "250 sender Ok\r\n"),
@@ -516,9 +554,9 @@ handle_request({<<"MAIL">>, Args},
 									{ok, State#state{callbackstate = CallbackState}}
 							end;
 						{ParsedAddress, ExtraInfo} ->
-							%io:format("From address ~s (parsed as ~s) with extra info ~s~n", [Address, ParsedAddress, ExtraInfo]),
+							?log(debug, "From address ~s (parsed as ~s) with extra info ~s~n", [Address, ParsedAddress, ExtraInfo]),
 							Options = [binstr:to_upper(X) || X <- binstr:split(ExtraInfo, <<" ">>)],
-							%io:format("options are ~p~n", [Options]),
+							?log(debug, "options are ~p~n", [Options]),
 							 F = fun(_, {error, Message}) ->
 									 {error, Message};
 								 (<<"SIZE=", Size/binary>>, InnerState) when MaxSize =:= 'infinity' ->
@@ -547,11 +585,11 @@ handle_request({<<"MAIL">>, Args},
 							end,
 							case lists:foldl(F, State, Options) of
 								{error, Message} ->
-									%io:format("error: ~s~n", [Message]),
+									?log(debug, "error: ~s~n", [Message]),
 									send(State, Message),
 									{ok, State};
 								NewState ->
-									%io:format("OK~n"),
+									?log(debug, "OK~n"),
 									case Module:handle_MAIL(ParsedAddress, State#state.callbackstate) of
 										{ok, CallbackState} ->
 											send(State, "250 sender Ok\r\n"),
@@ -570,9 +608,10 @@ handle_request({<<"MAIL">>, Args},
 			send(State, "503 Error: Nested MAIL command\r\n"),
 			{ok, State}
 	end;
-handle_request({<<"RCPT">>, _Args}, #state{envelope = undefined} = State) ->
+handle_request({<<"RCPT">> = C, _Args}, #state{envelope = undefined} = State) ->
 	send(State, "503 Error: need MAIL command\r\n"),
-	{ok, State};
+	State1 = handle_error(out_of_order, C, State),
+	{ok, State1};
 handle_request({<<"RCPT">>, Args}, #state{envelope = Envelope, module = Module, callbackstate = OldCallbackState} = State) ->
 	case binstr:strpos(binstr:to_upper(Args), <<"TO:">>) of
 		1 ->
@@ -586,7 +625,7 @@ handle_request({<<"RCPT">>, Args}, #state{envelope = Envelope, module = Module, 
 					send(State, "501 Bad recipient address syntax\r\n"),
 					{ok, State};
 				{ParsedAddress, <<>>} ->
-					%io:format("To address ~s (parsed as ~s)~n", [Address, ParsedAddress]),
+					?log(debug, "To address ~s (parsed as ~s)~n", [Address, ParsedAddress]),
 					case Module:handle_RCPT(ParsedAddress, OldCallbackState) of
 						{ok, CallbackState} ->
 							send(State, "250 recipient Ok\r\n"),
@@ -595,9 +634,9 @@ handle_request({<<"RCPT">>, Args}, #state{envelope = Envelope, module = Module, 
 							send(State, [Message, "\r\n"]),
 							{ok, State#state{callbackstate = CallbackState}}
 					end;
-				{_ParsedAddress, ExtraInfo} ->
+				{ParsedAddress, ExtraInfo} ->
 					% TODO - are there even any RCPT extensions?
-					% io:format("To address ~s (parsed as ~s) with extra info ~s~n", [Address, ParsedAddress, ExtraInfo]),
+					?log(debug, "To address ~s (parsed as ~s) with extra info ~s~n", [Address, ParsedAddress, ExtraInfo]),
 					send(State, ["555 Unsupported option: ", ExtraInfo, "\r\n"]),
 					{ok, State}
 			end;
@@ -605,20 +644,23 @@ handle_request({<<"RCPT">>, Args}, #state{envelope = Envelope, module = Module, 
 			send(State, "501 Syntax: RCPT TO:<address>\r\n"),
 			{ok, State}
 	end;
-handle_request({<<"DATA">>, <<>>}, #state{envelope = undefined} = State) ->
+handle_request({<<"DATA">> = C, <<>>}, #state{envelope = undefined} = State) ->
 	send(State, "503 Error: send HELO/EHLO first\r\n"),
-	{ok, State};
-handle_request({<<"DATA">>, <<>>}, #state{envelope = Envelope} = State) ->
+	State1 = handle_error(out_of_order, C, State),
+	{ok, State1};
+handle_request({<<"DATA">> = C, <<>>}, #state{envelope = Envelope} = State) ->
 	case {Envelope#envelope.from, Envelope#envelope.to} of
 		{undefined, _} ->
 			send(State, "503 Error: need MAIL command\r\n"),
-			{ok, State};
+			State1 = handle_error(out_of_order, C, State),
+			{ok, State1};
 		{_, []} ->
 			send(State, "503 Error: need RCPT command\r\n"),
-			{ok, State};
+			State1 = handle_error(out_of_order, C, State),
+			{ok, State1};
 		_Else ->
 			send(State, "354 enter mail, end with line containing only '.'\r\n"),
-			%io:format("switching to data read mode~n", []),
+			?log(debug, "switching to data read mode~n", []),
 
 			{ok, State#state{readmessage = true}}
 	end;
@@ -651,44 +693,49 @@ handle_request({<<"VRFY">>, Address}, #state{module= Module, callbackstate = Old
 			send(State, "501 Syntax: VRFY username/address\r\n"),
 			{ok, State}
 	end;
-handle_request({<<"STARTTLS">>, <<>>}, #state{socket = Socket, module = Module, tls=false, extensions = Extensions, callbackstate = OldCallbackState, options = Options} = State) ->
+handle_request({<<"STARTTLS">>, <<>>}, #state{socket = Socket, module = Module, tls=false,
+											  extensions = Extensions, callbackstate = OldCallbackState,
+											  options = Options} = State) ->
 	case has_extension(Extensions, "STARTTLS") of
 		{true, _} ->
 			send(State, "220 OK\r\n"),
-			Options1 = case proplists:get_value(certfile, Options) of
+			TlsOpts0 = proplists:get_value(tls_options, Options, []),
+			TlsOpts1 = case proplists:get_value(certfile, Options) of
 				undefined ->
-					[];
+					TlsOpts0;
 				CertFile ->
-					[{certfile, CertFile}]
+					[{certfile, CertFile} | TlsOpts0]
 			end,
-			Options2 = case proplists:get_value(keyfile, Options) of
+			TlsOpts2 = case proplists:get_value(keyfile, Options) of
 				undefined ->
-					Options1;
+					TlsOpts1;
 				KeyFile ->
-					[{keyfile, KeyFile} | Options1]
+					[{keyfile, KeyFile} | TlsOpts1]
 			end,
 			%% Assert that socket is in passive state
 			{ok, [{active, false}]} = inet:getopts(Socket, [active]),
-			% TODO: certfile and keyfile should be at configurable locations
-			case to_ssl(State, [{packet, line}, {mode, list}, {ssl_imp, new} | Options2]) of %XXX: see smtp_socket:?SSL_LISTEN_OPTIONS
+			TlsOpts3 = TlsOpts2 ++ [{versions, ['tlsv1', 'tlsv1.1', 'tlsv1.2', 'tlsv1.3', sslv3]}],
+			case to_ssl(State, [{packet, line}, {mode, list}, {ssl_imp, new} | TlsOpts3]) of %XXX: see smtp_socket:?SSL_LISTEN_OPTIONS
 				{ok, NewSocket} ->
-					%io:format("SSL negotiation sucessful~n"),
+					?log(debug, "SSL negotiation sucessful~n"),
 					ranch_ssl:setopts(NewSocket, [{packet, line}]),
 					{ok, State#state{socket = NewSocket, transport = ranch_ssl, envelope=undefined,
 							authdata=undefined, waitingauth=false, readmessage=false,
 							tls=true, callbackstate = Module:handle_STARTTLS(OldCallbackState)}};
-				{error, _Reason} ->
-					%io:format("SSL handshake failed : ~p~n", [Reason]),
+				{error, Reason} ->
+					?log(info, "SSL handshake failed : ~p~n", [Reason]),
 					send(State, "454 TLS negotiation failed\r\n"),
-					{ok, State}
+					State1 = handle_error(ssl_handshake_error, Reason, State),
+					{ok, State1}
 			end;
 		false ->
 			send(State, "500 Command unrecognized\r\n"),
 			{ok, State}
 	end;
-handle_request({<<"STARTTLS">>, <<>>}, State) ->
+handle_request({<<"STARTTLS">> = C, <<>>}, State) ->
 	send(State, "500 TLS already negotiated\r\n"),
-	{ok, State};
+	State1 = handle_error(out_of_order, C, State),
+	{ok, State1};
 handle_request({<<"STARTTLS">>, _Args}, State) ->
 	send(State, "501 Syntax error (no parameters allowed)\r\n"),
 	{ok, State};
@@ -701,6 +748,19 @@ handle_request({Verb, Args}, #state{module = Module, callbackstate = OldCallback
                 CState1
         end,
 	{ok, State#state{callbackstate = CallbackState}}.
+
+handle_error(Kind, Details, #state{module=Module, callbackstate = OldCallbackState} = State) ->
+	case erlang:function_exported(Module, handle_error, 3) of
+		true ->
+			case Module:handle_error(Kind, Details, OldCallbackState) of
+				{ok, CallbackState} ->
+					State#state{callbackstate = CallbackState};
+				{stop, Reason, CallbackState} ->
+					throw({stop, Reason, State#state{callbackstate = CallbackState}})
+			end;
+		false ->
+			State
+	end.
 
 -spec parse_encoded_address(Address :: binary()) -> {binary(), binary()} | 'error'.
 parse_encoded_address(<<>>) ->
@@ -761,7 +821,7 @@ parse_encoded_address(<<H, Tail/binary>>, Acc, Quotes) ->
 
 -spec has_extension(Extensions :: [{string(), string()}], Extension :: string()) -> {'true', string()} | 'false'.
 has_extension(Extensions, Ext) ->
-	%io:format("extensions ~p~n", [Extensions]),
+	?log(debug, "extensions ~p~n", [Extensions]),
 	case proplists:get_value(Ext, Extensions) of
 		undefined ->
 			false;
@@ -799,8 +859,7 @@ try_auth(AuthType, Username, Credential, #state{module = Module, envelope = Enve
 
 %% @doc a tight loop to receive the message body
 receive_data(_Acc, _Transport, _Socket, _, Size, MaxSize, Session, _Options) when MaxSize =/= 'infinity', Size > MaxSize ->
-	error_logger:info_msg("SMTP message body size ~B exceeded maximum allowed ~B~n", [Size, MaxSize]),
-	% io:format("message body size ~B exceeded maximum allowed ~B~n", [Size, MaxSize]),
+	?log(info, "SMTP message body size ~B exceeded maximum allowed ~B~n", [Size, MaxSize]),
 	Session ! {receive_data, {error, size_exceeded}};
 receive_data(Acc, Transport, Socket, RecvSize, Size, MaxSize, Session, Options) ->
 	case Transport:recv(Socket, RecvSize, 1000) of
@@ -811,15 +870,15 @@ receive_data(Acc, Transport, Socket, RecvSize, Size, MaxSize, Session, Options) 
 				FixedPacket ->
 					case binstr:strpos(FixedPacket, <<"\r\n.\r\n">>) of
 						0 ->
-							%io:format("received ~B bytes; size is now ~p~n", [RecvSize, Size + size(Packet)]),
-							%io:format("memory usage: ~p~n", [erlang:process_info(self(), memory)]),
+							?log(debug, "received ~B bytes; size is now ~p~n", [RecvSize, Size + size(Packet)]),
+							?log(debug, "memory usage: ~p~n", [erlang:process_info(self(), memory)]),
 							receive_data([FixedPacket | Acc], Transport, Socket, RecvSize, Size + byte_size(FixedPacket), MaxSize, Session, Options);
 						Index ->
 							String = binstr:substr(FixedPacket, 1, Index - 1),
 							Rest = binstr:substr(FixedPacket, Index+5),
-							%io:format("memory usage before flattening: ~p~n", [erlang:process_info(self(), memory)]),
+							?log(debug, "memory usage before flattening: ~p~n", [erlang:process_info(self(), memory)]),
 							Result = list_to_binary(lists:reverse([String | Acc])),
-							%io:format("memory usage after flattening: ~p~n", [erlang:process_info(self(), memory)]),
+							?log(debug, "memory usage after flattening: ~p~n", [erlang:process_info(self(), memory)]),
 							Session ! {receive_data, Result, Rest}
 					end
 			end;
@@ -831,15 +890,15 @@ receive_data(Acc, Transport, Socket, RecvSize, Size, MaxSize, Session, Options) 
 				FixedPacket ->
 					case binstr:strpos(FixedPacket, <<"\r\n.\r\n">>) of
 						0 ->
-							%io:format("received ~B bytes; size is now ~p~n", [RecvSize, Size + size(Packet)]),
-							%io:format("memory usage: ~p~n", [erlang:process_info(self(), memory)]),
+							?log(debug, "received ~B bytes; size is now ~p~n", [RecvSize, Size + size(Packet)]),
+							?log(debug, "memory usage: ~p~n", [erlang:process_info(self(), memory)]),
 							receive_data([FixedPacket | Acc], Transport, Socket, RecvSize, Size + byte_size(FixedPacket), MaxSize, Session, Options);
 						Index ->
 							String = binstr:substr(FixedPacket, 1, Index - 1),
 							Rest = binstr:substr(FixedPacket, Index+5),
-							%io:format("memory usage before flattening: ~p~n", [erlang:process_info(self(), memory)]),
+							?log(debug, "memory usage before flattening: ~p~n", [erlang:process_info(self(), memory)]),
 							Result = list_to_binary(lists:reverse([String | Acc])),
-							%io:format("memory usage after flattening: ~p~n", [erlang:process_info(self(), memory)]),
+							?log(debug, "memory usage after flattening: ~p~n", [erlang:process_info(self(), memory)]),
 							Session ! {receive_data, Result, Rest}
 					end
 			end;
@@ -850,15 +909,15 @@ receive_data(Acc, Transport, Socket, RecvSize, Size, MaxSize, Session, Options) 
 			case binstr:strpos(Packet, <<"\r\n.\r\n">>) of
 				0 ->
 					% uh-oh
-					%io:format("no data on socket, and no DATA terminator, retrying ~p~n", [Session]),
+					?log(debug, "no data on socket, and no DATA terminator, retrying ~p~n", [Session]),
 					% eventually we'll either get data or a different error, just keep retrying
 					receive_data(Acc, Transport, Socket, 0, Size, MaxSize, Session, Options);
 				Index ->
 					String = binstr:substr(Packet, 1, Index - 1),
 					Rest = binstr:substr(Packet, Index+5),
-					%io:format("memory usage before flattening: ~p~n", [erlang:process_info(self(), memory)]),
+					?log(debug, "memory usage before flattening: ~p~n", [erlang:process_info(self(), memory)]),
 					Result = list_to_binary(lists:reverse([String | Acc2])),
-					%io:format("memory usage after flattening: ~p~n", [erlang:process_info(self(), memory)]),
+					?log(debug, "memory usage after flattening: ~p~n", [erlang:process_info(self(), memory)]),
 					Session ! {receive_data, Result, Rest}
 			end;
 		{error, timeout} ->
@@ -947,11 +1006,7 @@ to_ssl(#state{ranch_version = lt16, socket = Socket}, Opts) ->
 	ssl_handshake(Socket, Opts, 5000).
 
 -spec ssl_handshake(gen_tcp:socket() | ssl:sslsocket(),
-                    [{packet, line} |
-                     {mode, list} |
-                     {ssl_imp, new} |
-                     {keyfile, file:name_all()} |
-                     {certfile, file:name_all()}],
+                    [tls_opt()],
                     timeout()) ->
                            {ok, ssl:sslsocket()} |
                            {error, any()}.
@@ -1899,8 +1954,9 @@ smtp_session_tls_test_() ->
 				{ok, Pid} = gen_smtp_server:start(
 							  smtp_server_example,
 							  [{sessionoptions,
-								[{keyfile, "test/fixtures/server.key"},
-								 {certfile, "test/fixtures/server.crt"},
+								[{tls_options,
+								  [{keyfile, "test/fixtures/mx1.example.com-server.key"},
+								   {certfile, "test/fixtures/mx1.example.com-server.crt"}]},
 								 {callbackoptions, [{auth, true}]}]},
 							   {domain, "localhost"},
 							   {port, 9876}]),
@@ -2311,6 +2367,97 @@ smtp_session_tls_test_() ->
 			end
 		]
 	}.
+
+smtp_session_tls_sni_test_() ->
+	{foreach,
+		local,
+		fun() ->
+				SniHosts =
+					[
+					 {"mx1.example.com",
+					  [{keyfile, "test/fixtures/mx1.example.com-server.key"},
+					   {certfile, "test/fixtures/mx1.example.com-server.crt"},
+					   {cacertfile, "test/fixtures/root.crt"}]},
+					 {"mx2.example.com",
+					  [{keyfile, "test/fixtures/mx2.example.com-server.key"},
+					   {certfile, "test/fixtures/mx2.example.com-server.crt"},
+					   {cacertfile, "test/fixtures/root.crt"}]}
+					],
+				gen_smtp_application:ensure_all_started(gen_smtp),
+				{ok, _} = gen_smtp_server:start(
+							smtp_server_example,
+							[{sessionoptions,
+							  [{tls_options, [{sni_hosts, SniHosts}]},
+							   {callbackoptions, [{auth, true}]}]},
+							 {domain, "localhost"},
+							 {port, 9876}]),
+				[Host || {Host, _} <- SniHosts]
+		end,
+		fun(_Hosts) ->
+                gen_smtp_server:stop(gen_smtp_server)
+		end,
+		[fun strict_sni/1]
+	}.
+
+strict_sni(Hosts) ->
+	{"Do strict validation based on SNI",
+	 fun() ->
+			 [begin
+				  {ok, CSock} = smtp_socket:connect(tcp, "localhost", 9876),
+				  smtp_socket:active_once(CSock),
+				  receive {tcp, CSock, Packet} -> smtp_socket:active_once(CSock) end,
+				  ?assertMatch("220 localhost"++_Stuff,  Packet),
+				  smtp_socket:send(CSock, "EHLO somehost.com\r\n"),
+				  receive {tcp, CSock, Packet2} -> smtp_socket:active_once(CSock) end,
+				  ?assertMatch("250-localhost\r\n",  Packet2),
+				  Foo = fun Foo(Acc) ->
+								receive
+									{tcp, CSock, "250-STARTTLS"++_} ->
+										smtp_socket:active_once(CSock),
+										Foo(true);
+									{tcp, CSock, "250-"++_Packet3} ->
+										smtp_socket:active_once(CSock),
+										Foo(Acc);
+									{tcp, CSock, "250 STARTTLS"++_} ->
+										smtp_socket:active_once(CSock),
+										true;
+									{tcp, CSock, "250 "++_Packet3} ->
+										smtp_socket:active_once(CSock),
+										Acc;
+									{tcp, CSock, _} ->
+										smtp_socket:active_once(CSock),
+										error
+								end
+						end,
+				  ?assertEqual(true, Foo(false)),
+				  smtp_socket:send(CSock, "STARTTLS\r\n"),
+				  receive {tcp, CSock, Packet4} -> ok end,
+				  ?assertMatch("220 "++_,  Packet4),
+				  {ok, TlsSocket} = ssl:connect(
+									  CSock,
+									  [{server_name_indication, Host},
+									   {verify, verify_peer},
+									   {cacertfile, "test/fixtures/root.crt"}]),
+				  %% Make sure server selects certificate based on SNI
+				  {ok, Cert} = ssl:peercert(TlsSocket),
+				  verify_cert_hostname(Cert, Host),
+				  smtp_socket:active_once(TlsSocket),
+				  smtp_socket:send(TlsSocket, "EHLO somehost.com\r\n"),
+				  receive {ssl, TlsSocket, Packet5} -> smtp_socket:active_once(TlsSocket) end,
+				  ?assertMatch("250-localhost\r\n",  Packet5),
+				  ssl:close(TlsSocket)
+			  end || Host <- Hosts]
+	 end
+	}.
+
+-ifdef(OTP_18).
+verify_cert_hostname(_, _) ->
+	noop.
+-else.
+verify_cert_hostname(BinCert, Host) ->
+	DecCert = public_key:pkix_decode_cert(BinCert, otp),
+	?assert(public_key:pkix_verify_hostname(DecCert, [{dns_id, Host}])).
+-endif.
 
 stray_newline_test_() ->
 	[
