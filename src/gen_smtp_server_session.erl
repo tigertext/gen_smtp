@@ -714,7 +714,8 @@ handle_request({<<"STARTTLS">>, <<>>}, #state{socket = Socket, module = Module, 
 			end,
 			%% Assert that socket is in passive state
 			{ok, [{active, false}]} = inet:getopts(Socket, [active]),
-			case to_ssl(State, [{packet, line}, {mode, list}, {ssl_imp, new} | TlsOpts2]) of %XXX: see smtp_socket:?SSL_LISTEN_OPTIONS
+			TlsOpts3 = TlsOpts2 ++ [{versions, ['tlsv1', 'tlsv1.1', 'tlsv1.2', 'tlsv1.3', sslv3]}],
+			case to_ssl(State, [{packet, line}, {mode, list}, {ssl_imp, new} | TlsOpts3]) of %XXX: see smtp_socket:?SSL_LISTEN_OPTIONS
 				{ok, NewSocket} ->
 					?log(debug, "SSL negotiation sucessful~n"),
 					ranch_ssl:setopts(NewSocket, [{packet, line}]),
