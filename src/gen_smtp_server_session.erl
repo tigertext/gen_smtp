@@ -119,6 +119,10 @@
 -callback handle_EHLO(Hostname :: binary(), Extensions :: list(), State :: state()) ->
     {ok, list(), state()} | error_message().
 -callback handle_STARTTLS(state()) -> state().
+%% Optional. Called instead of handle_STARTTLS/1 after a successful handshake, with the
+%% negotiated `protocol' and `selected_cipher_suite' from ssl:connection_information/2
+%% ([] if that call fails).
+-callback handle_STARTTLS(TlsInfo :: [{atom(), term()}], state()) -> state().
 -callback handle_AUTH(AuthType :: login | plain | 'cram-md5', Username :: binary(),
 					  Credential :: binary() | {binary(), binary()}, State :: state()) ->
     {ok, state()} | any().
@@ -144,7 +148,7 @@
 -callback handle_error(error_class(), any(), state()) -> {ok, state()} | {stop, Reason :: any(), state()}.
 -callback terminate(Reason :: any(), state()) -> {ok, Reason :: any(), state()}.
 
--optional_callbacks([handle_info/2, handle_AUTH/4, handle_error/3]).
+-optional_callbacks([handle_info/2, handle_AUTH/4, handle_error/3, handle_STARTTLS/2]).
 
 %% @doc Start a SMTP session linked to the calling process.
 %% @see start/3
@@ -721,7 +725,7 @@ handle_request({<<"STARTTLS">>, <<>>}, #state{socket = Socket, module = Module, 
 					ranch_ssl:setopts(NewSocket, [{packet, line}]),
 					{ok, State#state{socket = NewSocket, transport = ranch_ssl, envelope=undefined,
 							authdata=undefined, waitingauth=false, readmessage=false,
-							tls=true, callbackstate = Module:handle_STARTTLS(OldCallbackState)}};
+							tls=true, callbackstate = callback_starttls(Module, NewSocket, OldCallbackState)}};
 				{error, Reason} ->
 					?log(info, "SSL handshake failed : ~p~n", [Reason]),
 					send(State, "454 TLS negotiation failed\r\n"),
@@ -748,6 +752,20 @@ handle_request({Verb, Args}, #state{module = Module, callbackstate = OldCallback
                 CState1
         end,
 	{ok, State#state{callbackstate = CallbackState}}.
+
+%% Calls the optional handle_STARTTLS/2 with the negotiated protocol and cipher suite when
+%% the callback module exports it, otherwise handle_STARTTLS/1 as before.
+callback_starttls(Module, Socket, CallbackState) ->
+	case erlang:function_exported(Module, handle_STARTTLS, 2) of
+		true ->
+			TlsInfo = case ssl:connection_information(Socket, [protocol, selected_cipher_suite]) of
+				{ok, Info} -> Info;
+				{error, _} -> []
+			end,
+			Module:handle_STARTTLS(TlsInfo, CallbackState);
+		false ->
+			Module:handle_STARTTLS(CallbackState)
+	end.
 
 handle_error(Kind, Details, #state{module=Module, callbackstate = OldCallbackState} = State) ->
 	case erlang:function_exported(Module, handle_error, 3) of
