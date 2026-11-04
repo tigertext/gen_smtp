@@ -32,6 +32,7 @@
 
 -ifdef(TEST).
 -include_lib("eunit/include/eunit.hrl").
+-export([tls_info/1]).
 -endif.
 
 -define(DEFAULT_MAXSIZE, 10485760). %10mb
@@ -120,8 +121,8 @@
     {ok, list(), state()} | error_message().
 -callback handle_STARTTLS(state()) -> state().
 %% Optional. Called instead of handle_STARTTLS/1 after a successful handshake, with the
-%% negotiated `protocol' and `selected_cipher_suite' from ssl:connection_information/2
-%% ([] if that call fails).
+%% negotiated `protocol' and `selected_cipher_suite' from ssl:connection_information/2.
+%% The list may hold only some of those keys, and is [] if the information can't be read.
 -callback handle_STARTTLS(TlsInfo :: [{atom(), term()}], state()) -> state().
 -callback handle_AUTH(AuthType :: login | plain | 'cram-md5', Username :: binary(),
 					  Credential :: binary() | {binary(), binary()}, State :: state()) ->
@@ -758,13 +759,19 @@ handle_request({Verb, Args}, #state{module = Module, callbackstate = OldCallback
 callback_starttls(Module, Socket, CallbackState) ->
 	case erlang:function_exported(Module, handle_STARTTLS, 2) of
 		true ->
-			TlsInfo = case ssl:connection_information(Socket, [protocol, selected_cipher_suite]) of
-				{ok, Info} -> Info;
-				{error, _} -> []
-			end,
-			Module:handle_STARTTLS(TlsInfo, CallbackState);
+			Module:handle_STARTTLS(tls_info(Socket), CallbackState);
 		false ->
 			Module:handle_STARTTLS(CallbackState)
+	end.
+
+%% The negotiated protocol and cipher suite, or [] if they cannot be read. Runs right after
+%% every successful handshake, so neither an error nor an exception may end the session.
+tls_info(Socket) ->
+	try ssl:connection_information(Socket, [protocol, selected_cipher_suite]) of
+		{ok, Info} -> Info;
+		{error, _} -> []
+	catch
+		_:_ -> []
 	end.
 
 handle_error(Kind, Details, #state{module=Module, callbackstate = OldCallbackState} = State) ->

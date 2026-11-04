@@ -61,6 +61,31 @@ handle_starttls_2_receives_negotiated_protocol_and_cipher_test_() ->
 		end}
 	 end}.
 
+%% The info lookup must never crash the session after a successful handshake: an error
+%% tuple or an exception from ssl:connection_information/2 both give [].
+tls_info_falls_back_to_empty_list_test_() ->
+	[{"error tuple (socket already closed)",
+	  {timeout, 20, fun() ->
+		{ok, Listen} = ssl:listen(0, [{keyfile, "test/fixtures/mx1.example.com-server.key"},
+		                               {certfile, "test/fixtures/mx1.example.com-server.crt"},
+		                               {reuseaddr, true}]),
+		{ok, {_, Port}} = ssl:sockname(Listen),
+		Self = self(),
+		spawn_link(fun() ->
+			{ok, T} = ssl:transport_accept(Listen),
+			{ok, S} = ssl:handshake(T),
+			Self ! {server_socket, S}
+		end),
+		{ok, Client} = ssl:connect("localhost", Port, [{verify, verify_none}]),
+		Server = receive {server_socket, S} -> S after 5000 -> error(no_handshake) end,
+		ok = ssl:close(Server),
+		ok = ssl:close(Client),
+		ssl:close(Listen),
+		?assertEqual([], gen_smtp_server_session:tls_info(Server))
+	  end}},
+	 {"exception (not an ssl socket)",
+	  ?_assertEqual([], gen_smtp_server_session:tls_info(not_a_socket))}].
+
 start_server() ->
 	gen_smtp_application:ensure_all_started(gen_smtp),
 	{ok, Pid} = gen_smtp_server:start(
