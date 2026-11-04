@@ -13,7 +13,6 @@
 	handle_RCPT/2, handle_RCPT_extension/2, handle_DATA/4, handle_RSET/1, handle_VRFY/2,
 	handle_other/3, handle_STARTTLS/1, handle_STARTTLS/2, code_change/3, terminate/2]).
 
--define(PORT, 9877).
 -define(TEST_PROC, starttls_info_test_proc).
 
 init(Hostname, SessionCount, Address, Options) ->
@@ -98,14 +97,15 @@ start_server() ->
 		   %% smtp_server_example only advertises STARTTLS when auth is on
 		   {callbackoptions, [{auth, true}]}]},
 		 {domain, "localhost"},
-		 {port, ?PORT}]),
+		 %% Port 0: the OS picks a free one, so this can't collide with other suites.
+		 {port, 0}]),
 	Pid.
 
 stop_server(_Pid) ->
 	gen_smtp_server:stop(starttls_info_test_server).
 
 starttls_handshake() ->
-	{ok, Sock} = smtp_socket:connect(tcp, "localhost", ?PORT),
+	{ok, Sock} = smtp_socket:connect(tcp, "localhost", ranch:get_port({local, starttls_info_test_server})),
 	{ok, "220 " ++ _} = recv_line(Sock),
 	ok = smtp_socket:send(Sock, "EHLO somehost.com\r\n"),
 	ok = recv_until_last_ehlo_line(Sock),

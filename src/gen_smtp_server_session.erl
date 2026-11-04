@@ -765,7 +765,8 @@ callback_starttls(Module, Socket, CallbackState) ->
 	end.
 
 %% The negotiated protocol and cipher suite, or [] if they cannot be read. Runs right after
-%% every successful handshake, so neither an error nor an exception may end the session.
+%% every successful handshake, so an error result or an exception from
+%% ssl:connection_information/2 gives [] instead of ending the session.
 tls_info(Socket) ->
 	try ssl:connection_information(Socket, [protocol, selected_cipher_suite]) of
 		{ok, Info} -> Info;
