@@ -34,22 +34,40 @@ terminate(Reason, State) ->
 	catch ?TEST_PROC ! {session_terminated, Reason},
 	smtp_server_example:terminate(Reason, State).
 
+%% Each way a STARTTLS handshake can fail must end the session with reason normal, and
+%% promptly: after a failure ssl has closed the socket, and a session that kept going
+%% either crashed in setopts/2 ({badmatch, {error, einval}}) or sat on the dead socket
+%% until the session timeout.
 failed_handshake_ends_session_normally_test_() ->
 	{setup, fun start_server/0, fun stop_server/1,
 	 fun(_) ->
-		{timeout, 20, fun() ->
-			register(?TEST_PROC, self()),
-			try
-				{error, _} = starttls_handshake('tlsv1'),
-				Reason = receive {session_terminated, R} -> R
-						 after 5000 -> error(session_not_terminated)
-						 end,
-				?assertEqual(normal, Reason)
-			after
-				unregister(?TEST_PROC)
-			end
-		end}
+		[{Name, {timeout, 20, fun() -> assert_session_ends_normally(Client) end}}
+		 || {Name, Client} <-
+			[%% The server rejects the only version the client offers; the client hangs up.
+			 {"version rejected, client closes", fun(Sock) -> handshake(Sock, [{versions, ['tlsv1']}], close) end},
+			 %% Same, but the client keeps the TCP connection open and says nothing.
+			 {"version rejected, client stays silent", fun(Sock) -> handshake(Sock, [{versions, ['tlsv1']}], keep) end},
+			 %% The client aborts with an alert (it cannot verify the server's certificate).
+			 {"client sends an alert", fun(Sock) ->
+				handshake(Sock, [{versions, ['tlsv1.2']}, {verify, verify_peer},
+								  {verify_fun, {fun(_Cert, _Event, St) -> {fail, St} end, rejected_by_test}}], keep) end},
+			 %% The client hangs up right after the 220, before any handshake.
+			 {"client closes before the handshake", fun(Sock) -> smtp_socket:close(Sock), {error, closed} end}]]
 	 end}.
+
+assert_session_ends_normally(Client) ->
+	register(?TEST_PROC, self()),
+	try
+		Sock = starttls_220(),
+		{error, _} = Client(Sock),
+		Reason = receive {session_terminated, R} -> R
+				 after 5000 -> error(session_not_terminated)
+				 end,
+		catch smtp_socket:close(Sock),
+		?assertEqual(normal, Reason)
+	after
+		unregister(?TEST_PROC)
+	end.
 
 start_server() ->
 	gen_smtp_application:ensure_all_started(gen_smtp),
@@ -70,19 +88,24 @@ start_server() ->
 stop_server(_Pid) ->
 	gen_smtp_server:stop(starttls_failure_test_server).
 
-starttls_handshake(ClientVersion) ->
+%% Connects, sends EHLO and STARTTLS, and returns the plain socket once the server said 220.
+starttls_220() ->
 	{ok, Sock} = smtp_socket:connect(tcp, "localhost", ?PORT),
 	{ok, "220 " ++ _} = recv_line(Sock),
 	ok = smtp_socket:send(Sock, "EHLO somehost.com\r\n"),
 	ok = recv_until_last_ehlo_line(Sock),
 	ok = smtp_socket:send(Sock, "STARTTLS\r\n"),
 	{ok, "220 " ++ _} = recv_line(Sock),
-	Result = smtp_socket:to_ssl_client(Sock, [{versions, [ClientVersion]}], 5000),
-	case Result of
-		{ok, SslSock} -> smtp_socket:close(SslSock);
-		{error, _} -> smtp_socket:close(Sock)
-	end,
-	Result.
+	Sock.
+
+%% Attempts the client side of the handshake; on failure, closes the socket or keeps it open.
+handshake(Sock, SslOpts, AfterFailure) ->
+	case ssl:connect(Sock, [{active, false} | SslOpts], 5000) of
+		{ok, SslSock} -> smtp_socket:close(SslSock), ok;
+		{error, _} = Error ->
+			AfterFailure =:= close andalso smtp_socket:close(Sock),
+			Error
+	end.
 
 recv_line(Sock) -> smtp_socket:recv(Sock, 0, 5000).
 
