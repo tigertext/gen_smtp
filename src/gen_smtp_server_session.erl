@@ -719,7 +719,13 @@ handle_request({<<"STARTTLS">>, <<>>}, #state{socket = Socket, module = Module, 
 			end,
 			%% Assert that socket is in passive state
 			{ok, [{active, false}]} = inet:getopts(Socket, [active]),
-			TlsOpts3 = TlsOpts2 ++ [{versions, ['tlsv1', 'tlsv1.1', 'tlsv1.2', 'tlsv1.3', sslv3]}],
+			%% A {versions, ...} in tls_options wins; ssl uses the last duplicate, so only add the default when absent
+			TlsOpts3 = case proplists:is_defined(versions, TlsOpts2) of
+				true ->
+					TlsOpts2;
+				false ->
+					TlsOpts2 ++ [{versions, ['tlsv1.2', 'tlsv1.3']}]
+			end,
 			case to_ssl(State, [{packet, line}, {mode, list}, {ssl_imp, new} | TlsOpts3]) of %XXX: see smtp_socket:?SSL_LISTEN_OPTIONS
 				{ok, NewSocket} ->
 					?log(debug, "SSL negotiation sucessful~n"),
@@ -731,7 +737,8 @@ handle_request({<<"STARTTLS">>, <<>>}, #state{socket = Socket, module = Module, 
 					?log(info, "SSL handshake failed : ~p~n", [Reason]),
 					send(State, "454 TLS negotiation failed\r\n"),
 					State1 = handle_error(ssl_handshake_error, Reason, State),
-					{ok, State1}
+					%% ssl has closed the socket by now, so the session cannot continue
+					{stop, normal, State1}
 			end;
 		false ->
 			send(State, "500 Command unrecognized\r\n"),
