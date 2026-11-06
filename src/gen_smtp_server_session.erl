@@ -726,7 +726,8 @@ handle_request({<<"STARTTLS">>, <<>>}, #state{socket = Socket, module = Module, 
 					?log(info, "SSL handshake failed : ~p~n", [Reason]),
 					send(State, "454 TLS negotiation failed\r\n"),
 					State1 = handle_error(ssl_handshake_error, Reason, State),
-					{ok, State1}
+					%% ssl has closed the socket by now, so the session cannot continue
+					{stop, normal, State1}
 			end;
 		false ->
 			send(State, "500 Command unrecognized\r\n"),
