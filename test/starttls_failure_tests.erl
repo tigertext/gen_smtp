@@ -12,7 +12,7 @@
 	handle_RCPT/2, handle_RCPT_extension/2, handle_DATA/4, handle_RSET/1, handle_VRFY/2,
 	handle_other/3, handle_STARTTLS/1, handle_error/3, code_change/3, terminate/2]).
 
--define(PORT, 9880).
+-define(SERVER, starttls_failure_test_server).
 -define(TEST_PROC, starttls_failure_test_proc).
 %% Client options that make the client abort the handshake with an alert.
 -define(REJECT_CERT, [{verify, verify_peer},
@@ -64,15 +64,19 @@ assert_session_ends_normally(Client) ->
 	register(?TEST_PROC, self()),
 	try
 		Sock = starttls_220(),
-		{error, _} = Client(Sock),
-		Session = receive {handle_error, Pid, ssl_handshake_error} -> Pid
-				  after 5000 -> error(handle_error_not_called)
-				  end,
-		Reason = receive {session_terminated, Session, R} -> R
-				 after 5000 -> error(session_not_terminated)
-				 end,
-		catch smtp_socket:close(Sock),
-		?assertEqual(normal, Reason)
+		%% Close the client socket on every exit, including a timeout below.
+		try
+			{error, _} = Client(Sock),
+			Session = receive {handle_error, Pid, ssl_handshake_error} -> Pid
+					  after 5000 -> error(handle_error_not_called)
+					  end,
+			Reason = receive {session_terminated, Session, R} -> R
+					 after 5000 -> error(session_not_terminated)
+					 end,
+			?assertEqual(normal, Reason)
+		after
+			catch smtp_socket:close(Sock)
+		end
 	after
 		unregister(?TEST_PROC)
 	end.
@@ -80,7 +84,7 @@ assert_session_ends_normally(Client) ->
 start_server() ->
 	gen_smtp_application:ensure_all_started(gen_smtp),
 	{ok, Pid} = gen_smtp_server:start(
-		{local, starttls_failure_test_server},
+		{local, ?SERVER},
 		?MODULE,
 		[{sessionoptions,
 		  [{tls_options,
@@ -89,15 +93,16 @@ start_server() ->
 		   %% smtp_server_example only advertises STARTTLS when auth is on
 		   {callbackoptions, [{auth, true}]}]},
 		 {domain, "localhost"},
-		 {port, ?PORT}]),
+		 %% Port 0: the OS picks a free one, so parallel runs cannot collide.
+		 {port, 0}]),
 	Pid.
 
 stop_server(_Pid) ->
-	gen_smtp_server:stop(starttls_failure_test_server).
+	gen_smtp_server:stop(?SERVER).
 
 %% Connects, sends EHLO and STARTTLS, and returns the plain socket once the server said 220.
 starttls_220() ->
-	{ok, Sock} = smtp_socket:connect(tcp, "localhost", ?PORT),
+	{ok, Sock} = smtp_socket:connect(tcp, "localhost", ranch:get_port({local, ?SERVER})),
 	{ok, "220 " ++ _} = recv_line(Sock),
 	ok = smtp_socket:send(Sock, "EHLO somehost.com\r\n"),
 	ok = recv_until_last_ehlo_line(Sock),
