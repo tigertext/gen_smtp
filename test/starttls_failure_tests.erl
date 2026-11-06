@@ -2,14 +2,15 @@
 %% crashing on the socket that ssl already closed.
 %%
 %% This module is also the callback module under test: it delegates every callback to
-%% smtp_server_example and reports the terminate/2 reason to the registered test process.
+%% smtp_server_example and reports handle_error/3 and terminate/2 calls to the registered
+%% test process, tagged with the session pid.
 -module(starttls_failure_tests).
 
 -include_lib("eunit/include/eunit.hrl").
 
 -export([init/4, handle_HELO/2, handle_EHLO/3, handle_MAIL/2, handle_MAIL_extension/2,
 	handle_RCPT/2, handle_RCPT_extension/2, handle_DATA/4, handle_RSET/1, handle_VRFY/2,
-	handle_other/3, handle_STARTTLS/1, code_change/3, terminate/2]).
+	handle_other/3, handle_STARTTLS/1, handle_error/3, code_change/3, terminate/2]).
 
 -define(PORT, 9880).
 -define(TEST_PROC, starttls_failure_test_proc).
@@ -32,14 +33,17 @@ handle_VRFY(Address, State) -> smtp_server_example:handle_VRFY(Address, State).
 handle_other(Verb, Args, State) -> smtp_server_example:handle_other(Verb, Args, State).
 handle_STARTTLS(State) -> smtp_server_example:handle_STARTTLS(State).
 code_change(OldVsn, State, Extra) -> smtp_server_example:code_change(OldVsn, State, Extra).
+handle_error(Class, Details, State) ->
+	catch ?TEST_PROC ! {handle_error, self(), Class},
+	smtp_server_example:handle_error(Class, Details, State).
 terminate(Reason, State) ->
-	catch ?TEST_PROC ! {session_terminated, Reason},
+	catch ?TEST_PROC ! {session_terminated, self(), Reason},
 	smtp_server_example:terminate(Reason, State).
 
 %% Each way a STARTTLS handshake can fail must end the session with reason normal, and
 %% promptly: after a failure ssl has closed the socket, and a session that kept going
-%% either crashed in setopts/2 ({badmatch, {error, einval}}) or sat on the dead socket
-%% until the session timeout.
+%% crashed in setopts/2 ({badmatch, {error, einval}}). The callback's handle_error/3 must
+%% still see the failure first, since that is where callback modules log it.
 failed_handshake_ends_session_normally_test_() ->
 	{setup, fun start_server/0, fun stop_server/1,
 	 fun(_) ->
@@ -61,7 +65,10 @@ assert_session_ends_normally(Client) ->
 	try
 		Sock = starttls_220(),
 		{error, _} = Client(Sock),
-		Reason = receive {session_terminated, R} -> R
+		Session = receive {handle_error, Pid, ssl_handshake_error} -> Pid
+				  after 5000 -> error(handle_error_not_called)
+				  end,
+		Reason = receive {session_terminated, Session, R} -> R
 				 after 5000 -> error(session_not_terminated)
 				 end,
 		catch smtp_socket:close(Sock),
