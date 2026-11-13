@@ -61,6 +61,32 @@ first_line_only_test_() ->
 			{ok, "503 " ++ _} = recv_line(Sock),
 			ok = ehlo(Sock),
 			?assertEqual([{203, 0, 113, 7}], source_ips(Sock))
+		 end},
+		 {"a malformed first PROXY still uses up the first line", fun() ->
+			Sock = connect(proxy_any),
+			ok = smtp_socket:send(Sock, "PROXY garbage\r\n"),
+			ok = smtp_socket:send(Sock, ?PROXY("203.0.113.7")),
+			{ok, "503 " ++ _} = recv_line(Sock),
+			?assertEqual([], source_ips(Sock))
+		 end}]).
+
+%% STARTTLS does not reopen the window: the first line over TLS is not the
+%% first line of the session.
+after_starttls_test_() ->
+	with_server(proxy_tls,
+		[{tls_options, [{keyfile, "test/fixtures/mx1.example.com-server.key"},
+						{certfile, "test/fixtures/mx1.example.com-server.crt"}]},
+		 %% smtp_server_example only advertises STARTTLS when auth is on
+		 {callbackoptions, [{auth, true}]}],
+		[{"PROXY as the first line after STARTTLS is rejected", fun() ->
+			Sock = connect(proxy_tls),
+			ok = ehlo(Sock),
+			ok = smtp_socket:send(Sock, "STARTTLS\r\n"),
+			{ok, "220 " ++ _} = recv_line(Sock),
+			{ok, Tls} = ssl:connect(Sock, [{active, false}, {verify, verify_none}], 5000),
+			ok = ssl:send(Tls, ?PROXY("203.0.113.7")),
+			{ok, "503 " ++ _} = ssl:recv(Tls, 0, 5000),
+			?assertEqual([], source_ips(Tls))
 		 end}]).
 
 %% proxy_trusted_sources set: PROXY counts only when the TCP peer (127.0.0.1
@@ -73,6 +99,13 @@ trusted_sources_test_() ->
 			%% the next reply must be EHLO's: a reply to PROXY would put the
 			%% client one response out of step
 			ok = ehlo(Sock),
+			?assertEqual([], source_ips(Sock))
+		 end},
+		 {"a late PROXY from a peer outside the list gets 503", fun() ->
+			Sock = connect(proxy_untrusted),
+			ok = ehlo(Sock),
+			ok = smtp_socket:send(Sock, ?PROXY("10.1.2.3")),
+			{ok, "503 " ++ _} = recv_line(Sock),
 			?assertEqual([], source_ips(Sock))
 		 end}]),
 	 with_server(proxy_trusted, [{proxy_trusted_sources, ["10.0.0.0/8", "127.0.0.0/8"]}],
@@ -98,7 +131,15 @@ ip_in_cidrs_test_() ->
 	 ?_assertNot(In({10, 1, 2, 3}, ["::/0"])),
 	 ?_assertNot(In({10, 1, 2, 3}, ["10.0.0.0/33", "10.0.0.0/x", "not-an-ip/8", "10.0.0.0/"])),
 	 ?_assertNot(In(undefined, ["0.0.0.0/0"])),
-	 ?_assertNot(In({10, 1, 2, 3}, []))].
+	 ?_assertNot(In({10, 1, 2, 3}, [])),
+	 %% IPv4-mapped IPv6 peers are not matched against IPv4 ranges
+	 ?_assertNot(In({0, 0, 0, 0, 0, 16#ffff, 16#0a00, 16#0001}, ["10.0.0.0/8"])),
+	 %% a flat string (not a list of CIDRs) matches nothing instead of crashing
+	 ?_assertNot(In({10, 1, 2, 3}, "10.0.0.0/8"))].
+
+valid_cidr_test_() ->
+	[?_assert(smtp_util:valid_cidr(C)) || C <- ["10.0.0.0/8", <<"fd00::/8">>, "127.0.0.1", "0.0.0.0/0"]] ++
+	[?_assertNot(smtp_util:valid_cidr(C)) || C <- ["10.0.0.0/33", "10.0.0.0/x", "nope/8", "", "10.0.0.0/", any, 42]].
 
 %%% helpers
 
@@ -132,7 +173,7 @@ ehlo(Sock) ->
 %% The session handles lines in order, so once EHLO (or a 503) has been answered,
 %% any update_source_ip/2 call for an earlier line has already been sent.
 source_ips(Sock) ->
-	smtp_socket:close(Sock),
+	catch smtp_socket:close(Sock),
 	collect([]).
 
 collect(Acc) ->

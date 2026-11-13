@@ -26,7 +26,7 @@
 -export([
 		mxlookup/1, guess_FQDN/0, compute_cram_digest/2, get_cram_string/1,
 		trim_crlf/1, rfc5322_timestamp/0, zone/0, generate_message_id/0,
-         parse_rfc822_addresses/1, get_source_ip_from_proxy/1, ip_in_cidrs/2,
+         parse_rfc822_addresses/1, get_source_ip_from_proxy/1, ip_in_cidrs/2, valid_cidr/1,
          combine_rfc822_addresses/1,
          generate_message_boundary/0]).
 
@@ -275,26 +275,37 @@ ip_in_cidrs(undefined, _Cidrs) ->
 ip_in_cidrs(Ip, Cidrs) ->
 	lists:any(fun(Cidr) -> ip_in_cidr(Ip, Cidr) end, Cidrs).
 
-ip_in_cidr(Ip, Cidr) when is_binary(Cidr) ->
-	ip_in_cidr(Ip, binary_to_list(Cidr));
+%% IPv4 and IPv6 are matched separately: an IPv4-mapped IPv6 peer
+%% (::ffff:10.0.0.1) does not match "10.0.0.0/8". Listeners default to inet.
 ip_in_cidr(Ip, Cidr) ->
-	{AddrStr, LenStr} = case string:split(Cidr, "/") of
-		[A, L] -> {A, L};
-		[A] -> {A, undefined}
-	end,
-	case inet:parse_strict_address(AddrStr) of
-		{ok, Net} when tuple_size(Net) =:= tuple_size(Ip) ->
-			Bits = ip_bits(Ip),
-			Max = bit_size(Bits),
-			case prefix_length(LenStr, Max) of
-				{ok, Len} ->
-					<<Prefix:Len/bitstring, _/bitstring>> = Bits,
-					<<NetPrefix:Len/bitstring, _/bitstring>> = ip_bits(Net),
-					Prefix =:= NetPrefix;
-				error -> false
-			end;
+	case parse_cidr(Cidr) of
+		{ok, Net, Len} when tuple_size(Net) =:= tuple_size(Ip) ->
+			<<Prefix:Len/bitstring, _/bitstring>> = ip_bits(Ip),
+			<<NetPrefix:Len/bitstring, _/bitstring>> = ip_bits(Net),
+			Prefix =:= NetPrefix;
 		_ -> false
 	end.
+
+%% @doc true if `Cidr' is an address or address/prefix that ip_in_cidrs/2 can match.
+-spec valid_cidr(term()) -> boolean().
+valid_cidr(Cidr) ->
+	parse_cidr(Cidr) =/= error.
+
+parse_cidr(Cidr) when is_binary(Cidr) ->
+	parse_cidr(binary_to_list(Cidr));
+parse_cidr(Cidr) when is_list(Cidr) ->
+	try
+		{AddrStr, LenStr} = case string:split(Cidr, "/") of
+			[A, L] -> {A, L};
+			[A] -> {A, undefined}
+		end,
+		{ok, Net} = inet:parse_strict_address(AddrStr),
+		{ok, Len} = prefix_length(LenStr, bit_size(ip_bits(Net))),
+		{ok, Net, Len}
+	catch _:_ -> error
+	end;
+parse_cidr(_) ->
+	error.
 
 prefix_length(undefined, Max) -> {ok, Max};
 prefix_length(LenStr, Max) ->

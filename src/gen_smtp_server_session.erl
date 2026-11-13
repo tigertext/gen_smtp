@@ -342,6 +342,9 @@ code_change(OldVsn, #state{module = Module, callbackstate = CallbackState} = Sta
 		end,
 	{ok, State#state{callbackstate = CallbackState}}.
 
+format_peer(undefined) -> "unknown";
+format_peer(Ip) -> inet:ntoa(Ip).
+
 %% Every line after the first one closes the window for PROXY.
 first_line_handled({ok, State}) -> {ok, State#state{proxy_allowed = false}};
 first_line_handled({stop, Reason, State}) -> {stop, Reason, State#state{proxy_allowed = false}}.
@@ -379,11 +382,13 @@ handle_request({<<>>, _Any}, State) ->
 	send(State, "500 Error: bad syntax\r\n"),
 	{ok, State};
 %% PROXY (HAProxy protocol v1) carries the client address when a load balancer
-%% is in front. Only the first line of a session can be the load balancer's;
-%% anything later was typed by the client, which must not choose its own source
-%% address (CP-899).
+%% is in front. Only the first line of a session can be the load balancer's, so
+%% a later PROXY was sent by the client and is refused (CP-899). The first line
+%% itself is only as trustworthy as the peer that sent it: with
+%% proxy_trusted_sources left at `any', a client that reaches the listener
+%% directly can still send it.
 handle_request({<<"PROXY">>, _Params}, #state{proxy_allowed = false} = State) ->
-	?log(warning, "PROXY after the first command from ~p, rejected~n", [State#state.peer]),
+	?log(warning, "PROXY after the first command from ~s, rejected~n", [format_peer(State#state.peer)]),
 	send(State, "503 5.5.1 Error: PROXY is only accepted as the first command\r\n"),
 	{ok, State};
 handle_request({<<"PROXY">>, Params}, #state{module = Module, callbackstate = OldCallbackState,
@@ -392,7 +397,7 @@ handle_request({<<"PROXY">>, Params}, #state{module = Module, callbackstate = Ol
 	%% and the client is not waiting for an answer to it.
 	case is_trusted_proxy_source(Peer, Options) of
 		false ->
-			?log(warning, "PROXY from untrusted peer ~p ignored~n", [Peer]),
+			?log(warning, "PROXY from untrusted peer ~s ignored~n", [format_peer(Peer)]),
 			{ok, State};
 		true ->
 			New_State = case smtp_util:get_source_ip_from_proxy(Params) of
