@@ -75,7 +75,11 @@
 		readmessage = false :: boolean(),
 		tls = false :: boolean(),
 		callbackstate :: any(),
-		options = [] :: [tuple()]
+		options = [] :: [tuple()],
+		%% address of the TCP peer (the load balancer when one is in front)
+		peer :: inet:ip_address() | undefined,
+		%% PROXY is only honoured as the first line of a session (CP-899)
+		proxy_allowed = true :: boolean()
 	}
 ).
 
@@ -204,6 +208,7 @@ init([Ref, Transport, Socket, Module, RanchVer, Options]) ->
 						ranch_ref = Ref,
 						ranch_version = RanchVer,
 						options = Options,
+						peer = PeerName,
 						callbackstate = CallbackState}, ?TIMEOUT};
 		{stop, Reason, Message} ->
 			Transport:send(Socket, [Message, "\r\n"]),
@@ -273,7 +278,7 @@ handle_info({receive_data, Body, Rest},
 	end;
 handle_info({SocketType, Socket, Packet}, #state{socket = Socket, transport = Transport} = State)
   when SocketType =:= tcp; SocketType =:= ssl ->
-	case handle_request(parse_request(Packet), State) of
+	case first_line_handled(handle_request(parse_request(Packet), State)) of
 		{ok, #state{options = Options, readmessage = true, maxsize = MaxSize} = NewState} ->
 			Session = self(),
 			Size = 0,
@@ -337,6 +342,19 @@ code_change(OldVsn, #state{module = Module, callbackstate = CallbackState} = Sta
 		end,
 	{ok, State#state{callbackstate = CallbackState}}.
 
+%% Every line after the first one closes the window for PROXY.
+first_line_handled({ok, State}) -> {ok, State#state{proxy_allowed = false}};
+first_line_handled({stop, Reason, State}) -> {stop, Reason, State#state{proxy_allowed = false}}.
+
+%% `proxy_trusted_sources' session option: `any' (the default, so existing
+%% deployments keep working) or a list of CIDR strings such as "10.0.0.0/8".
+-spec is_trusted_proxy_source(Peer :: inet:ip_address() | undefined, Options :: list()) -> boolean().
+is_trusted_proxy_source(Peer, Options) ->
+	case proplists:get_value(proxy_trusted_sources, Options, any) of
+		any -> true;
+		Cidrs when is_list(Cidrs) -> smtp_util:ip_in_cidrs(Peer, Cidrs)
+	end.
+
 -spec parse_request(Packet :: binary()) -> {binary(), binary()}.
 parse_request(Packet) ->
 	Request = binstr:strip(binstr:strip(binstr:strip(binstr:strip(Packet, right, $\n), right, $\r), right, $\s), left, $\s),
@@ -360,14 +378,31 @@ parse_request(Packet) ->
 handle_request({<<>>, _Any}, State) ->
 	send(State, "500 Error: bad syntax\r\n"),
 	{ok, State};
-handle_request({<<"PROXY">>, Params}, #state{module = Module, callbackstate = OldCallbackState} = State) ->
-  New_State = case smtp_util:get_source_ip_from_proxy(Params) of
-      undefined -> State;
-      Ip -> %% save for mail session
-          {ok, CallbackState} = Module:update_source_ip(Ip, OldCallbackState),
-          State#state{callbackstate = CallbackState}
-  end,
-	{ok, New_State};
+%% PROXY (HAProxy protocol v1) carries the client address when a load balancer
+%% is in front. Only the first line of a session can be the load balancer's;
+%% anything later was typed by the client, which must not choose its own source
+%% address (CP-899).
+handle_request({<<"PROXY">>, _Params}, #state{proxy_allowed = false} = State) ->
+	?log(warning, "PROXY after the first command from ~p, rejected~n", [State#state.peer]),
+	send(State, "503 5.5.1 Error: PROXY is only accepted as the first command\r\n"),
+	{ok, State};
+handle_request({<<"PROXY">>, Params}, #state{module = Module, callbackstate = OldCallbackState,
+											 peer = Peer, options = Options} = State) ->
+	%% No reply either way: the load balancer sends PROXY on the client's behalf
+	%% and the client is not waiting for an answer to it.
+	case is_trusted_proxy_source(Peer, Options) of
+		false ->
+			?log(warning, "PROXY from untrusted peer ~p ignored~n", [Peer]),
+			{ok, State};
+		true ->
+			New_State = case smtp_util:get_source_ip_from_proxy(Params) of
+				undefined -> State;
+				Ip -> %% save for mail session
+					{ok, CallbackState} = Module:update_source_ip(Ip, OldCallbackState),
+					State#state{callbackstate = CallbackState}
+			end,
+			{ok, New_State}
+	end;
 handle_request({<<"HELO">>, <<>>}, State) ->
 	send(State, "501 Syntax: HELO hostname\r\n"),
 	{ok, State};
