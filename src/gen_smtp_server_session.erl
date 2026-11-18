@@ -947,13 +947,17 @@ has_extension(Extensions, Ext) ->
 	end.
 
 
--spec try_auth(AuthType :: 'login' | 'plain' | 'cram-md5', Username :: binary(), Credential :: binary() | {binary(), binary()}, State :: #state{}) -> {'ok', #state{}}.
+-spec try_auth(AuthType :: 'login' | 'plain' | 'cram-md5', Username :: binary(), Credential :: binary() | {binary(), binary()}, State :: #state{}) -> {'ok', #state{}} | {'stop', 'normal', #state{}}.
 try_auth(AuthType, Username, Credential, #state{module = Module, envelope = Envelope, callbackstate = OldCallbackState} = State) ->
 	% clear out waiting auth
 	NewState = State#state{waitingauth = false, envelope = Envelope#envelope{auth = {<<>>, <<>>}}},
 	case erlang:function_exported(Module, handle_AUTH, 4) of
 		true ->
-			case Module:handle_AUTH(AuthType, Username, Credential, OldCallbackState) of
+			%% A crash in the callback must not take the session down with an exit reason:
+			%% its stack trace carries the credential as an argument, and the crash report
+			%% also prints the last message received, the AUTH line itself. Reply 454 and
+			%% stop normally (no crash report); log the class and error tag only.
+			try Module:handle_AUTH(AuthType, Username, Credential, OldCallbackState) of
 				{ok, CallbackState} ->
 					send(State, "235 Authentication successful.\r\n"),
 					{ok, NewState#state{callbackstate = CallbackState,
@@ -961,12 +965,22 @@ try_auth(AuthType, Username, Credential, #state{module = Module, envelope = Enve
 				_Other ->
 					send(State, "535 Authentication failed.\r\n"),
 					{ok, NewState}
-				end;
+			catch
+				Class:Error ->
+					?log(error, "AUTH callback ~p:handle_AUTH/4 crashed: ~p:~p", [Module, Class, error_tag(Error)]),
+					send(State, "454 4.7.0 Temporary authentication failure\r\n"),
+					{stop, normal, NewState}
+			end;
 		false ->
 			error_logger:error_msg("Please define handle_AUTH/4 in your server module or remove AUTH from your module extensions~n"),
 			send(State, "535 authentication failed (#5.7.1)\r\n"),
 			{ok, NewState}
 	end.
+
+%% Only the tag of an error term: the full term can hold the credential (badmatch, case_clause).
+error_tag(Error) when is_atom(Error) -> Error;
+error_tag(Error) when is_tuple(Error), tuple_size(Error) > 0, is_atom(element(1, Error)) -> element(1, Error);
+error_tag(_) -> other.
 
 %get_digest_nonce() ->
 	%A = [io_lib:format("~2.16.0b", [X]) || <<X>> <= erlang:md5(integer_to_list(rand:uniform(4294967295)))],
