@@ -44,7 +44,7 @@
 -export([ranch_init/1]).
 
 %% gen_server callbacks
--export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2,
+-export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2, format_status/2,
 		code_change/3]).
 -export_type([options/0, error_class/0]).
 
@@ -153,7 +153,14 @@
 -callback handle_error(error_class(), any(), state()) -> {ok, state()} | {stop, Reason :: any(), state()}.
 -callback terminate(Reason :: any(), state()) -> {ok, Reason :: any(), state()}.
 
--optional_callbacks([handle_info/2, handle_AUTH/4, handle_error/3, handle_STARTTLS/2]).
+%% Optional. Called by format_status/2 below with gen_server's arguments, the callback
+%% module's own state in place of the session's. Its result replaces the callback state in
+%% sys:get_status/1 and in crash reports; without it the callback state is shown as
+%% `redacted', since it may hold credentials.
+-callback format_status(Opt :: normal | terminate, [list() | state()]) -> term().
+
+-optional_callbacks([handle_info/2, handle_AUTH/4, handle_error/3, handle_STARTTLS/2,
+                     format_status/2]).
 
 %% @doc Start a SMTP session linked to the calling process.
 %% @see start/3
@@ -330,6 +337,49 @@ terminate(Reason, #state{socket = Socket, transport = Transport, module = Module
                          callbackstate = CallbackState}) ->
 	ok = Transport:close(Socket),
 	Module:terminate(Reason, CallbackState).
+
+%% @hidden
+%% What sys:get_status/1 and the crash report of a dying session show. The session holds
+%% secrets: the AUTH credential (envelope auth and, mid-exchange, authdata), message data,
+%% and whatever the callback module keeps in its state. Those are replaced, and the
+%% callback module can say what of its own state to show (see the format_status callback).
+-spec format_status(Opt :: normal | terminate, [list() | #state{}]) -> term().
+format_status(Opt, [PDict, #state{} = State]) ->
+	Shown = redact_state(Opt, PDict, State),
+	case Opt of
+		terminate -> Shown;
+		_ -> [{data, [{"State", Shown}]}]
+	end;
+format_status(_Opt, [_PDict, Other]) ->
+	Other.
+
+%% setelement, not record update: the redacted values are outside the fields' declared types.
+redact_state(Opt, PDict, #state{module = Module, callbackstate = CallbackState,
+                                envelope = Envelope, authdata = AuthData} = State) ->
+	lists:foldl(fun({Index, Value}, Acc) -> setelement(Index, Acc, Value) end, State,
+		[{#state.callbackstate, callback_status(Module, Opt, PDict, CallbackState)},
+		 {#state.envelope, redact_envelope(Envelope)},
+		 {#state.authdata, redact(AuthData)}]).
+
+callback_status(Module, Opt, PDict, CallbackState) ->
+	case erlang:function_exported(Module, format_status, 2) of
+		true ->
+			try Module:format_status(Opt, [PDict, CallbackState])
+			catch _:_ -> redacted
+			end;
+		false ->
+			redacted
+	end.
+
+redact_envelope(#envelope{auth = {User, _Credential}, data = Data} = Envelope) ->
+	setelement(#envelope.data, setelement(#envelope.auth, Envelope, {User, redacted}),
+	           redact(Data));
+redact_envelope(Envelope) ->
+	Envelope.
+
+redact(undefined) -> undefined;
+redact(<<>>) -> <<>>;
+redact(Bin) when is_binary(Bin) -> {redacted, byte_size(Bin)}.
 
 %% @hidden
 -spec code_change(OldVsn :: any(), State :: #state{}, Extra :: any()) ->  {'ok', #state{}}.
