@@ -26,7 +26,7 @@
 -export([
 		mxlookup/1, guess_FQDN/0, compute_cram_digest/2, get_cram_string/1,
 		trim_crlf/1, rfc5322_timestamp/0, zone/0, generate_message_id/0,
-         parse_rfc822_addresses/1, get_source_ip_from_proxy/1, 
+         parse_rfc822_addresses/1, get_source_ip_from_proxy/1, ip_in_cidrs/2, valid_cidr/1,
          combine_rfc822_addresses/1,
          generate_message_boundary/0]).
 
@@ -265,3 +265,54 @@ scan_rfc822_scan_endquote([$"|Rest], Acc, false) ->
 	{lists:reverse(Acc), Rest};
 scan_rfc822_scan_endquote([Ch|Rest], Acc, _) ->
 	scan_rfc822_scan_endquote(Rest, [Ch|Acc], false).
+
+%% @doc true if `Ip' falls inside any of `Cidrs' ("10.0.0.0/8", "fd00::/8", or a
+%% bare address for a single host). IPv4 and IPv6 are matched separately; an
+%% unparsable entry never matches.
+-spec ip_in_cidrs(Ip :: inet:ip_address() | undefined, Cidrs :: [string() | binary()]) -> boolean().
+ip_in_cidrs(undefined, _Cidrs) ->
+	false;
+ip_in_cidrs(Ip, Cidrs) ->
+	lists:any(fun(Cidr) -> ip_in_cidr(Ip, Cidr) end, Cidrs).
+
+%% IPv4 and IPv6 are matched separately: an IPv4-mapped IPv6 peer
+%% (::ffff:10.0.0.1) does not match "10.0.0.0/8". Listeners default to inet.
+ip_in_cidr(Ip, Cidr) ->
+	case parse_cidr(Cidr) of
+		{ok, Net, Len} when tuple_size(Net) =:= tuple_size(Ip) ->
+			<<Prefix:Len/bitstring, _/bitstring>> = ip_bits(Ip),
+			<<NetPrefix:Len/bitstring, _/bitstring>> = ip_bits(Net),
+			Prefix =:= NetPrefix;
+		_ -> false
+	end.
+
+%% @doc true if `Cidr' is an address or address/prefix that ip_in_cidrs/2 can match.
+-spec valid_cidr(term()) -> boolean().
+valid_cidr(Cidr) ->
+	parse_cidr(Cidr) =/= error.
+
+parse_cidr(Cidr) when is_binary(Cidr) ->
+	parse_cidr(binary_to_list(Cidr));
+parse_cidr(Cidr) when is_list(Cidr) ->
+	try
+		{AddrStr, LenStr} = case string:split(Cidr, "/") of
+			[A, L] -> {A, L};
+			[A] -> {A, undefined}
+		end,
+		{ok, Net} = inet:parse_strict_address(AddrStr),
+		{ok, Len} = prefix_length(LenStr, bit_size(ip_bits(Net))),
+		{ok, Net, Len}
+	catch _:_ -> error
+	end;
+parse_cidr(_) ->
+	error.
+
+prefix_length(undefined, Max) -> {ok, Max};
+prefix_length(LenStr, Max) ->
+	case string:to_integer(LenStr) of
+		{Len, []} when Len >= 0, Len =< Max -> {ok, Len};
+		_ -> error
+	end.
+
+ip_bits({A, B, C, D}) -> <<A:8, B:8, C:8, D:8>>;
+ip_bits({A, B, C, D, E, F, G, H}) -> <<A:16, B:16, C:16, D:16, E:16, F:16, G:16, H:16>>.
