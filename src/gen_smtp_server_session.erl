@@ -44,7 +44,7 @@
 -export([ranch_init/1]).
 
 %% gen_server callbacks
--export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2,
+-export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2, format_status/2,
 		code_change/3]).
 -export_type([options/0, error_class/0]).
 
@@ -153,7 +153,14 @@
 -callback handle_error(error_class(), any(), state()) -> {ok, state()} | {stop, Reason :: any(), state()}.
 -callback terminate(Reason :: any(), state()) -> {ok, Reason :: any(), state()}.
 
--optional_callbacks([handle_info/2, handle_AUTH/4, handle_error/3, handle_STARTTLS/2]).
+%% Optional. Called by format_status/2 below with gen_server's arguments, the callback
+%% module's own state in place of the session's. Its result replaces the callback state in
+%% sys:get_status/1 and in crash reports; without it the callback state is shown as
+%% `redacted', since it may hold credentials.
+-callback format_status(Opt :: normal | terminate, [list() | state()]) -> term().
+
+-optional_callbacks([handle_info/2, handle_AUTH/4, handle_error/3, handle_STARTTLS/2,
+                     format_status/2]).
 
 %% @doc Start a SMTP session linked to the calling process.
 %% @see start/3
@@ -332,6 +339,49 @@ terminate(Reason, #state{socket = Socket, transport = Transport, module = Module
 	Module:terminate(Reason, CallbackState).
 
 %% @hidden
+%% What sys:get_status/1 and the crash report of a dying session show. The session holds
+%% secrets: the AUTH credential (envelope auth and, mid-exchange, authdata), message data,
+%% and whatever the callback module keeps in its state. Those are replaced, and the
+%% callback module can say what of its own state to show (see the format_status callback).
+-spec format_status(Opt :: normal | terminate, [list() | #state{}]) -> term().
+format_status(Opt, [PDict, #state{} = State]) ->
+	Shown = redact_state(Opt, PDict, State),
+	case Opt of
+		terminate -> Shown;
+		_ -> [{data, [{"State", Shown}]}]
+	end;
+format_status(_Opt, [_PDict, Other]) ->
+	Other.
+
+%% setelement, not record update: the redacted values are outside the fields' declared types.
+redact_state(Opt, PDict, #state{module = Module, callbackstate = CallbackState,
+                                envelope = Envelope, authdata = AuthData} = State) ->
+	lists:foldl(fun({Index, Value}, Acc) -> setelement(Index, Acc, Value) end, State,
+		[{#state.callbackstate, callback_status(Module, Opt, PDict, CallbackState)},
+		 {#state.envelope, redact_envelope(Envelope)},
+		 {#state.authdata, redact(AuthData)}]).
+
+callback_status(Module, Opt, PDict, CallbackState) ->
+	case erlang:function_exported(Module, format_status, 2) of
+		true ->
+			try Module:format_status(Opt, [PDict, CallbackState])
+			catch _:_ -> redacted
+			end;
+		false ->
+			redacted
+	end.
+
+redact_envelope(#envelope{auth = {User, _Credential}, data = Data} = Envelope) ->
+	setelement(#envelope.data, setelement(#envelope.auth, Envelope, {User, redacted}),
+	           redact(Data));
+redact_envelope(Envelope) ->
+	Envelope.
+
+redact(undefined) -> undefined;
+redact(<<>>) -> <<>>;
+redact(Bin) when is_binary(Bin) -> {redacted, byte_size(Bin)}.
+
+%% @hidden
 -spec code_change(OldVsn :: any(), State :: #state{}, Extra :: any()) ->  {'ok', #state{}}.
 code_change(OldVsn, #state{module = Module, callbackstate = CallbackState} = State, Extra) ->
 	% TODO - this should probably be the callback module's version or its checksum
@@ -363,7 +413,13 @@ parse_request(Packet) ->
 	Request = binstr:strip(binstr:strip(binstr:strip(binstr:strip(Packet, right, $\n), right, $\r), right, $\s), left, $\s),
 	case binstr:strchr(Request, $\s) of
 		0 ->
-		    ?log(debug, "got a ~s request~n", [Request]),
+			%% a line without a space may be a base64 AUTH reply (a credential): log only
+			%% the commands that take no argument
+			case lists:member(binstr:to_upper(Request), [<<"QUIT">>, <<"DATA">>, <<"RSET">>, <<"NOOP">>,
+			                                             <<"HELP">>, <<"STARTTLS">>, <<"EHLO">>, <<"HELO">>]) of
+				true -> ?log(debug, "got a ~s request~n", [Request]);
+				false -> ?log(debug, "got a client reply line~n", [])
+			end,
 			case binstr:to_upper(Request) of
 				<<"QUIT">> = Res -> {Res, <<>>};
 				<<"DATA">> = Res -> {Res, <<>>};
@@ -373,7 +429,14 @@ parse_request(Packet) ->
 		Index ->
 			Verb = binstr:substr(Request, 1, Index - 1),
 			Parameters = binstr:strip(binstr:substr(Request, Index + 1), left, $\s),
-			?log(debug, "got a ~s request with parameters ~s~n", [Verb, Parameters]),
+			case binstr:to_upper(Verb) of
+				%% AUTH PLAIN carries the credential in its parameters: log the mechanism only
+				<<"AUTH">> ->
+					?log(debug, "got an AUTH request, mechanism ~s~n",
+						[hd(binstr:split(Parameters, <<" ">>) ++ [<<>>])]);
+				_ ->
+					?log(debug, "got a ~s request with parameters ~s~n", [Verb, Parameters])
+			end,
 			{binstr:to_upper(Verb), Parameters}
 	end.
 
@@ -507,11 +570,13 @@ handle_request({<<"AUTH">>, Args}, #state{extensions = Extensions, envelope = En
 							{ok, State#state{waitingauth = 'login', envelope = Envelope#envelope{auth = {<<>>, <<>>}}}};
 						<<"PLAIN">> when Parameters =/= false ->
 							% TODO - duplicated below in handle_request waitingauth PLAIN
-							case binstr:split(base64:decode(Parameters), <<0>>) of
+							case split64(Parameters, <<0>>) of
 								[_Identity, Username, Password] ->
 									try_auth('plain', Username, Password, State);
 								[Username, Password] ->
 									try_auth('plain', Username, Password, State);
+								[undecodable] ->
+									auth_undecodable(State);
 								_ ->
 									% TODO error
 									{ok, State}
@@ -535,9 +600,11 @@ handle_request({<<"AUTH">>, Args}, #state{extensions = Extensions, envelope = En
 
 % the client sends a response to auth-cram-md5
 handle_request({Username64, <<>>}, #state{waitingauth = 'cram-md5', envelope = #envelope{auth = {<<>>, <<>>}}, authdata = AuthData} = State) ->
-	case binstr:split(base64:decode(Username64), <<" ">>) of
+	case split64(Username64, <<" ">>) of
 		[Username, Digest] ->
 			try_auth('cram-md5', Username, {Digest, AuthData}, State#state{authdata=undefined});
+		[undecodable] ->
+			auth_undecodable(State#state{authdata=undefined});
 		_ ->
 			% TODO error
 			{ok, State#state{waitingauth=false, authdata=undefined}}
@@ -545,11 +612,13 @@ handle_request({Username64, <<>>}, #state{waitingauth = 'cram-md5', envelope = #
 
 % the client sends a \0username\0password response to auth-plain
 handle_request({Username64, <<>>}, #state{waitingauth = 'plain', envelope = #envelope{auth = {<<>>,<<>>}}} = State) ->
-	case binstr:split(base64:decode(Username64), <<0>>) of
+	case split64(Username64, <<0>>) of
 		[_Identity, Username, Password] ->
 			try_auth('plain', Username, Password, State);
 		[Username, Password] ->
 			try_auth('plain', Username, Password, State);
+		[undecodable] ->
+			auth_undecodable(State);
 		_ ->
 			% TODO error
 			{ok, State#state{waitingauth=false}}
@@ -558,17 +627,22 @@ handle_request({Username64, <<>>}, #state{waitingauth = 'plain', envelope = #env
 % the client sends a username response to auth-login
 handle_request({Username64, <<>>}, #state{waitingauth = 'login', envelope = #envelope{auth = {<<>>,<<>>}}} = State) ->
 	Envelope = State#state.envelope,
-	Username = base64:decode(Username64),
-	% smtp_socket:send(Socket, "334 " ++ base64:encode_to_string("Password:")),
-	send(State, "334 UGFzc3dvcmQ6\r\n"),
-	% store the provided username in envelope.auth
-	NewState = State#state{envelope = Envelope#envelope{auth = {Username, <<>>}}},
-	{ok, NewState};
+	case decode64(Username64) of
+		undecodable ->
+			auth_undecodable(State);
+		Username ->
+			% smtp_socket:send(Socket, "334 " ++ base64:encode_to_string("Password:")),
+			send(State, "334 UGFzc3dvcmQ6\r\n"),
+			% store the provided username in envelope.auth
+			{ok, State#state{envelope = Envelope#envelope{auth = {Username, <<>>}}}}
+	end;
 
 % the client sends a password response to auth-login
 handle_request({Password64, <<>>}, #state{waitingauth = 'login', envelope = #envelope{auth = {Username,<<>>}}} = State) ->
-	Password = base64:decode(Password64),
-	try_auth('login', Username, Password, State);
+	case decode64(Password64) of
+		undecodable -> auth_undecodable(State);
+		Password -> try_auth('login', Username, Password, State)
+	end;
 
 handle_request({<<"MAIL">> = C, _Args}, #state{envelope = undefined} = State) ->
 	send(State, "503 Error: send HELO/EHLO first\r\n"),
@@ -911,12 +985,30 @@ try_auth(AuthType, Username, Credential, #state{module = Module, envelope = Enve
 				_Other ->
 					send(State, "535 Authentication failed.\r\n"),
 					{ok, NewState}
-				end;
+			end;
 		false ->
 			error_logger:error_msg("Please define handle_AUTH/4 in your server module or remove AUTH from your module extensions~n"),
 			send(State, "535 authentication failed (#5.7.1)\r\n"),
 			{ok, NewState}
 	end.
+
+%% Base64 from the client. base64:decode/1 raises on bad input, and a crash here would put
+%% the AUTH line (the last message received) in the crash report.
+decode64(Bin) ->
+	try base64:decode(Bin)
+	catch error:_ -> undecodable
+	end.
+
+%% Decodes, then splits on Sep; [undecodable] when the client's base64 is bad.
+split64(Bin, Sep) ->
+	case decode64(Bin) of
+		undecodable -> [undecodable];
+		Decoded -> binstr:split(Decoded, Sep)
+	end.
+
+auth_undecodable(#state{envelope = Envelope} = State) ->
+	send(State, "501 5.5.2 Cannot decode response\r\n"),
+	{ok, State#state{waitingauth = false, envelope = Envelope#envelope{auth = {<<>>, <<>>}}}}.
 
 %get_digest_nonce() ->
 	%A = [io_lib:format("~2.16.0b", [X]) || <<X>> <= erlang:md5(integer_to_list(rand:uniform(4294967295)))],
