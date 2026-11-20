@@ -17,8 +17,8 @@
 -define(LISTENER, setopts_failure_test_listener).
 -define(TEST_PROC, setopts_failure_test_proc).
 -define(MAXSIZE, 50).
-%% Re-arming after the DATA reply is the fourth {active, once}: the replies to EHLO, MAIL and
-%% RCPT come first.
+%% Re-arming after the reply that ends DATA (250, 552 or 451) is the fourth {active, once}:
+%% the re-arms after the EHLO, MAIL and RCPT replies come first.
 -define(AFTER_DATA, {[{active, once}], closed, 3}).
 
 init(Hostname, SessionCount, Address, Options) ->
@@ -104,11 +104,11 @@ setopts_failure_test_() ->
 		   end}},
 		  {"DATA: re-arming after a complete message over SIZE is rejected fails",
 		   {timeout, 15, fun() ->
-			%% the whole message arrives in one packet, so it completes before the size check
-			%% in receive_data/8 and is rejected after it is read
+			%% one byte over SIZE, sent at once: the message is complete after a single read, so
+			%% receive_data/8 never reaches its size check and the session rejects it afterwards
 			?assertEqual([{handle_error, tcp_closed}, {terminate, normal}],
 						 run(?AFTER_DATA,
-							 fun(Sock) -> send_message(Sock, "small.com", big_body() ++ "\r\n.\r\n") end))
+							 fun(Sock) -> send_message(Sock, "small.com", lists:duplicate(?MAXSIZE + 1, $x) ++ "\r\n.\r\n") end))
 		   end}}]}
 	 end}.
 

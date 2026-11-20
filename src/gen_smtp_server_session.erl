@@ -275,7 +275,8 @@ handle_info({receive_data, Body, Rest},
 			end;
 		false ->
 			send(State, "552 Message too large\r\n"),
-			% might not even be able to get here anymore...
+			% reached when the whole message arrives in a single read, before receive_data/8
+			% checks the size
 			continue(State#state{readmessage = false, envelope = #envelope{}}, [{active, once}])
 	end;
 handle_info({SocketType, Socket, Packet}, #state{socket = Socket, transport = Transport} = State)
