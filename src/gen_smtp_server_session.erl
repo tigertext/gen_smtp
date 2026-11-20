@@ -413,7 +413,13 @@ parse_request(Packet) ->
 	Request = binstr:strip(binstr:strip(binstr:strip(binstr:strip(Packet, right, $\n), right, $\r), right, $\s), left, $\s),
 	case binstr:strchr(Request, $\s) of
 		0 ->
-		    ?log(debug, "got a ~s request~n", [Request]),
+			%% a line without a space may be a base64 AUTH reply (a credential): log only
+			%% the commands that take no argument
+			case lists:member(binstr:to_upper(Request), [<<"QUIT">>, <<"DATA">>, <<"RSET">>, <<"NOOP">>,
+			                                             <<"HELP">>, <<"STARTTLS">>, <<"EHLO">>, <<"HELO">>]) of
+				true -> ?log(debug, "got a ~s request~n", [Request]);
+				false -> ?log(debug, "got a client reply line~n", [])
+			end,
 			case binstr:to_upper(Request) of
 				<<"QUIT">> = Res -> {Res, <<>>};
 				<<"DATA">> = Res -> {Res, <<>>};
@@ -423,7 +429,14 @@ parse_request(Packet) ->
 		Index ->
 			Verb = binstr:substr(Request, 1, Index - 1),
 			Parameters = binstr:strip(binstr:substr(Request, Index + 1), left, $\s),
-			?log(debug, "got a ~s request with parameters ~s~n", [Verb, Parameters]),
+			case binstr:to_upper(Verb) of
+				%% AUTH PLAIN carries the credential in its parameters: log the mechanism only
+				<<"AUTH">> ->
+					?log(debug, "got an AUTH request, mechanism ~s~n",
+						[hd(binstr:split(Parameters, <<" ">>) ++ [<<>>])]);
+				_ ->
+					?log(debug, "got a ~s request with parameters ~s~n", [Verb, Parameters])
+			end,
 			{binstr:to_upper(Verb), Parameters}
 	end.
 
@@ -557,11 +570,13 @@ handle_request({<<"AUTH">>, Args}, #state{extensions = Extensions, envelope = En
 							{ok, State#state{waitingauth = 'login', envelope = Envelope#envelope{auth = {<<>>, <<>>}}}};
 						<<"PLAIN">> when Parameters =/= false ->
 							% TODO - duplicated below in handle_request waitingauth PLAIN
-							case binstr:split(base64:decode(Parameters), <<0>>) of
+							case split64(Parameters, <<0>>) of
 								[_Identity, Username, Password] ->
 									try_auth('plain', Username, Password, State);
 								[Username, Password] ->
 									try_auth('plain', Username, Password, State);
+								[undecodable] ->
+									auth_undecodable(State);
 								_ ->
 									% TODO error
 									{ok, State}
@@ -585,9 +600,11 @@ handle_request({<<"AUTH">>, Args}, #state{extensions = Extensions, envelope = En
 
 % the client sends a response to auth-cram-md5
 handle_request({Username64, <<>>}, #state{waitingauth = 'cram-md5', envelope = #envelope{auth = {<<>>, <<>>}}, authdata = AuthData} = State) ->
-	case binstr:split(base64:decode(Username64), <<" ">>) of
+	case split64(Username64, <<" ">>) of
 		[Username, Digest] ->
 			try_auth('cram-md5', Username, {Digest, AuthData}, State#state{authdata=undefined});
+		[undecodable] ->
+			auth_undecodable(State#state{authdata=undefined});
 		_ ->
 			% TODO error
 			{ok, State#state{waitingauth=false, authdata=undefined}}
@@ -595,11 +612,13 @@ handle_request({Username64, <<>>}, #state{waitingauth = 'cram-md5', envelope = #
 
 % the client sends a \0username\0password response to auth-plain
 handle_request({Username64, <<>>}, #state{waitingauth = 'plain', envelope = #envelope{auth = {<<>>,<<>>}}} = State) ->
-	case binstr:split(base64:decode(Username64), <<0>>) of
+	case split64(Username64, <<0>>) of
 		[_Identity, Username, Password] ->
 			try_auth('plain', Username, Password, State);
 		[Username, Password] ->
 			try_auth('plain', Username, Password, State);
+		[undecodable] ->
+			auth_undecodable(State);
 		_ ->
 			% TODO error
 			{ok, State#state{waitingauth=false}}
@@ -608,17 +627,22 @@ handle_request({Username64, <<>>}, #state{waitingauth = 'plain', envelope = #env
 % the client sends a username response to auth-login
 handle_request({Username64, <<>>}, #state{waitingauth = 'login', envelope = #envelope{auth = {<<>>,<<>>}}} = State) ->
 	Envelope = State#state.envelope,
-	Username = base64:decode(Username64),
-	% smtp_socket:send(Socket, "334 " ++ base64:encode_to_string("Password:")),
-	send(State, "334 UGFzc3dvcmQ6\r\n"),
-	% store the provided username in envelope.auth
-	NewState = State#state{envelope = Envelope#envelope{auth = {Username, <<>>}}},
-	{ok, NewState};
+	case decode64(Username64) of
+		undecodable ->
+			auth_undecodable(State);
+		Username ->
+			% smtp_socket:send(Socket, "334 " ++ base64:encode_to_string("Password:")),
+			send(State, "334 UGFzc3dvcmQ6\r\n"),
+			% store the provided username in envelope.auth
+			{ok, State#state{envelope = Envelope#envelope{auth = {Username, <<>>}}}}
+	end;
 
 % the client sends a password response to auth-login
 handle_request({Password64, <<>>}, #state{waitingauth = 'login', envelope = #envelope{auth = {Username,<<>>}}} = State) ->
-	Password = base64:decode(Password64),
-	try_auth('login', Username, Password, State);
+	case decode64(Password64) of
+		undecodable -> auth_undecodable(State);
+		Password -> try_auth('login', Username, Password, State)
+	end;
 
 handle_request({<<"MAIL">> = C, _Args}, #state{envelope = undefined} = State) ->
 	send(State, "503 Error: send HELO/EHLO first\r\n"),
@@ -947,17 +971,13 @@ has_extension(Extensions, Ext) ->
 	end.
 
 
--spec try_auth(AuthType :: 'login' | 'plain' | 'cram-md5', Username :: binary(), Credential :: binary() | {binary(), binary()}, State :: #state{}) -> {'ok', #state{}} | {'stop', 'normal', #state{}}.
+-spec try_auth(AuthType :: 'login' | 'plain' | 'cram-md5', Username :: binary(), Credential :: binary() | {binary(), binary()}, State :: #state{}) -> {'ok', #state{}}.
 try_auth(AuthType, Username, Credential, #state{module = Module, envelope = Envelope, callbackstate = OldCallbackState} = State) ->
 	% clear out waiting auth
 	NewState = State#state{waitingauth = false, envelope = Envelope#envelope{auth = {<<>>, <<>>}}},
 	case erlang:function_exported(Module, handle_AUTH, 4) of
 		true ->
-			%% A crash in the callback must not take the session down with an exit reason:
-			%% its stack trace carries the credential as an argument, and the crash report
-			%% also prints the last message received, the AUTH line itself. Reply 454 and
-			%% stop normally (no crash report); log the class and error tag only.
-			try Module:handle_AUTH(AuthType, Username, Credential, OldCallbackState) of
+			case Module:handle_AUTH(AuthType, Username, Credential, OldCallbackState) of
 				{ok, CallbackState} ->
 					send(State, "235 Authentication successful.\r\n"),
 					{ok, NewState#state{callbackstate = CallbackState,
@@ -965,11 +985,6 @@ try_auth(AuthType, Username, Credential, #state{module = Module, envelope = Enve
 				_Other ->
 					send(State, "535 Authentication failed.\r\n"),
 					{ok, NewState}
-			catch
-				Class:Error ->
-					?log(error, "AUTH callback ~p:handle_AUTH/4 crashed: ~p:~p", [Module, Class, error_tag(Error)]),
-					send(State, "454 4.7.0 Temporary authentication failure\r\n"),
-					{stop, normal, NewState}
 			end;
 		false ->
 			error_logger:error_msg("Please define handle_AUTH/4 in your server module or remove AUTH from your module extensions~n"),
@@ -977,10 +992,23 @@ try_auth(AuthType, Username, Credential, #state{module = Module, envelope = Enve
 			{ok, NewState}
 	end.
 
-%% Only the tag of an error term: the full term can hold the credential (badmatch, case_clause).
-error_tag(Error) when is_atom(Error) -> Error;
-error_tag(Error) when is_tuple(Error), tuple_size(Error) > 0, is_atom(element(1, Error)) -> element(1, Error);
-error_tag(_) -> other.
+%% Base64 from the client. base64:decode/1 raises on bad input, and a crash here would put
+%% the AUTH line (the last message received) in the crash report.
+decode64(Bin) ->
+	try base64:decode(Bin)
+	catch error:_ -> undecodable
+	end.
+
+%% Decodes, then splits on Sep; [undecodable] when the client's base64 is bad.
+split64(Bin, Sep) ->
+	case decode64(Bin) of
+		undecodable -> [undecodable];
+		Decoded -> binstr:split(Decoded, Sep)
+	end.
+
+auth_undecodable(#state{envelope = Envelope} = State) ->
+	send(State, "501 5.5.2 Cannot decode response\r\n"),
+	{ok, State#state{waitingauth = false, envelope = Envelope#envelope{auth = {<<>>, <<>>}}}}.
 
 %get_digest_nonce() ->
 	%A = [io_lib:format("~2.16.0b", [X]) || <<X>> <= erlang:md5(integer_to_list(rand:uniform(4294967295)))],
