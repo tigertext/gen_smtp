@@ -200,8 +200,13 @@ init([Ref, Transport, Socket, Module, RanchVer, Options]) ->
 			ignore;
 		{ok, Banner, CallbackState} ->
 			Transport:send(Socket, ["220 ", Banner, "\r\n"]),
-			ok = Transport:setopts(Socket, [{active, once},
-											{packet, line}]),
+			case Transport:setopts(Socket, [{active, once}, {packet, line}]) of
+				ok -> ok;
+				%% The socket will deliver nothing, so the session would wait for the
+				%% timeout. Queue the message a closed or broken socket produces instead,
+				%% so it ends through the usual path: handle_error/3, then terminate/2.
+				{error, Reason} -> self() ! socket_gone_message(Transport, Socket, Reason)
+			end,
 			{ok, #state{socket = Socket,
 						transport = Transport,
 						module = Module,
@@ -234,14 +239,12 @@ handle_cast(_Msg, State) ->
 -spec handle_info(Message :: any(), State :: #state{}) -> {'noreply', #state{}} | {'stop', any(), #state{}}.
 handle_info({receive_data, {error, size_exceeded}}, #state{readmessage = true} = State) ->
 	send(State, "552 Message too large\r\n"),
-	setopts(State, [{active, once}]),
 	State1 = handle_error(data_rejected, size_exceeded, State),
-	{noreply, State1#state{readmessage = false, envelope = #envelope{}}, ?TIMEOUT};
+	continue(State1#state{readmessage = false, envelope = #envelope{}}, [{active, once}]);
 handle_info({receive_data, {error, bare_newline}}, #state{readmessage = true} = State) ->
 	send(State, "451 Bare newline detected\r\n"),
-	setopts(State, [{active, once}]),
 	State1 = handle_error(data_rejected, bare_neline, State),
-	{noreply, State1#state{readmessage = false, envelope = #envelope{}}, ?TIMEOUT};
+	continue(State1#state{readmessage = false, envelope = #envelope{}}, [{active, once}]);
 handle_info({receive_data, Body, Rest},
 			#state{socket = Socket, transport = Transport, readmessage = true, envelope = Env, module=Module,
 				   callbackstate = OldCallbackState, maxsize=MaxSize} = State) ->
@@ -250,7 +253,9 @@ handle_info({receive_data, Body, Rest},
 		<<>> -> ok; % no remaining data
 		_ -> self() ! {Transport:name(), Socket, Rest}
 	end,
-	setopts(State, [{packet, line}]),
+	%% The message is complete, so it is handled even if the client has already gone;
+	%% the continue/2 after handle_DATA ends the session in that case.
+	_ = setopts(State, [{packet, line}]),
 	%% Unescape periods at start of line (rfc5321 4.5.2)
 	UnescapedBody = re:replace(Body, <<"^\\\.">>, <<>>, [global, multiline, {return, binary}]),
 	Envelope = Env#envelope{data = UnescapedBody},
@@ -259,22 +264,20 @@ handle_info({receive_data, Body, Rest},
 			case Module:handle_DATA(Envelope#envelope.from, Envelope#envelope.to, Envelope#envelope.data, OldCallbackState) of
 				{ok, Reference, CallbackState} ->
 					send(State, io_lib:format("250 queued as ~s\r\n", [Reference])),
-					setopts(State, [{active, once}]),
-					{noreply, State#state{readmessage = false,
-										  envelope = #envelope{},
-										  callbackstate = CallbackState}, ?TIMEOUT};
+					continue(State#state{readmessage = false,
+										 envelope = #envelope{},
+										 callbackstate = CallbackState}, [{active, once}]);
 				{error, Message, CallbackState} ->
 					send(State, [Message, "\r\n"]),
-					setopts(State, [{active, once}]),
-					{noreply, State#state{readmessage = false,
-										  envelope = #envelope{},
-										  callbackstate = CallbackState}, ?TIMEOUT}
+					continue(State#state{readmessage = false,
+										 envelope = #envelope{},
+										 callbackstate = CallbackState}, [{active, once}])
 			end;
 		false ->
 			send(State, "552 Message too large\r\n"),
-			setopts(State, [{active, once}]),
-			% might not even be able to get here anymore...
-			{noreply, State#state{readmessage = false, envelope = #envelope{}}, ?TIMEOUT}
+			% reached when the whole message arrives in a single read, before receive_data/8
+			% checks the size
+			continue(State#state{readmessage = false, envelope = #envelope{}}, [{active, once}])
 	end;
 handle_info({SocketType, Socket, Packet}, #state{socket = Socket, transport = Transport} = State)
   when SocketType =:= tcp; SocketType =:= ssl ->
@@ -282,16 +285,19 @@ handle_info({SocketType, Socket, Packet}, #state{socket = Socket, transport = Tr
 		{ok, #state{options = Options, readmessage = true, maxsize = MaxSize} = NewState} ->
 			Session = self(),
 			Size = 0,
-			setopts(NewState, [{packet, raw}]),
-			%% TODO: change to receive asynchronously in the same process
-			spawn_opt(fun() ->
-							  receive_data([], Transport, Socket, 0, Size, MaxSize, Session, Options)
-					  end,
-					  [link, {fullsweep_after, 0}]),
-			{noreply, NewState, ?TIMEOUT};
+			case setopts(NewState, [{packet, raw}]) of
+				ok ->
+					%% TODO: change to receive asynchronously in the same process
+					spawn_opt(fun() ->
+									  receive_data([], Transport, Socket, 0, Size, MaxSize, Session, Options)
+							  end,
+							  [link, {fullsweep_after, 0}]),
+					{noreply, NewState, ?TIMEOUT};
+				{error, Reason} ->
+					socket_gone(Reason, NewState)
+			end;
 		{ok, NewState} ->
-			setopts(NewState, [{active, once}]),
-			{noreply, NewState, ?TIMEOUT};
+			continue(NewState, [{active, once}]);
 		{stop, Reason, NewState} ->
 			{stop, Reason, NewState}
 	end;
@@ -763,6 +769,8 @@ handle_request({<<"STARTTLS">>, <<>>}, #state{socket = Socket, module = Module, 
 			case to_ssl(State, [{packet, line}, {mode, list}, {ssl_imp, new} | TlsOpts3]) of %XXX: see smtp_socket:?SSL_LISTEN_OPTIONS
 				{ok, NewSocket} ->
 					?log(debug, "SSL negotiation sucessful~n"),
+					%% Result ignored: if the client has already closed, the continue/2 that
+					%% re-arms the socket after this command ends the session (CP-918).
 					ranch_ssl:setopts(NewSocket, [{packet, line}]),
 					{ok, State#state{socket = NewSocket, transport = ranch_ssl, envelope=undefined,
 							authdata=undefined, waitingauth=false, readmessage=false,
@@ -1065,7 +1073,36 @@ send(#state{transport = Transport, socket = Sock}, Data) ->
     Transport:send(Sock, Data).
 
 setopts(#state{transport = Transport, socket = Sock}, Opts) ->
-    ok = Transport:setopts(Sock, Opts).
+    Transport:setopts(Sock, Opts).
+
+%% Re-arms the socket and waits for the next packet. setopts/2 fails when the client has
+%% already closed the socket (e.g. right after a STARTTLS handshake, CP-918); the session
+%% then ends with reason normal, as on tcp_closed / ssl_closed.
+continue(State, Opts) ->
+    case setopts(State, Opts) of
+        ok -> {noreply, State, ?TIMEOUT};
+        {error, Reason} -> socket_gone(Reason, State)
+    end.
+
+socket_gone(Reason, #state{transport = Transport} = State) ->
+    {Kind, Details} = socket_gone_kind(Transport, Reason),
+    {stop, normal, handle_error(Kind, Details, State)}.
+
+%% The message the socket itself sends when it is closed or fails; handle_info/2 handles
+%% both by calling handle_error/3 and stopping with normal.
+socket_gone_message(Transport, Socket, Reason) ->
+    case socket_gone_kind(Transport, Reason) of
+        {Kind, []} -> {Kind, Socket};
+        {Kind, Details} -> {Kind, Socket, Details}
+    end.
+
+socket_gone_kind(Transport, Reason) ->
+    case {Transport:name(), Reason} of
+        {ssl, closed} -> {ssl_closed, []};
+        {_, closed} -> {tcp_closed, []};
+        {ssl, _} -> {ssl_error, Reason};
+        {_, _} -> {tcp_error, Reason}
+    end.
 
 to_ssl(#state{ranch_version = gte16, socket = Socket}, Opts) ->
 	ranch_ssl:handshake(Socket, Opts, 5000);
@@ -1089,6 +1126,12 @@ hostname(Opts) ->
     proplists:get_value(hostname, Opts, smtp_util:guess_FQDN()).
 
 -ifdef(TEST).
+socket_gone_kind_test_() ->
+	[?_assertEqual({ssl_closed, []}, socket_gone_kind(ranch_ssl, closed)),
+	 ?_assertEqual({tcp_closed, []}, socket_gone_kind(ranch_tcp, closed)),
+	 ?_assertEqual({ssl_error, einval}, socket_gone_kind(ranch_ssl, einval)),
+	 ?_assertEqual({tcp_error, einval}, socket_gone_kind(ranch_tcp, einval))].
+
 parse_encoded_address_test_() ->
 	[
 		{"Valid addresses should parse",
