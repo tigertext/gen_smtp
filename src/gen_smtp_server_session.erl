@@ -1125,6 +1125,12 @@ hostname(Opts) ->
     proplists:get_value(hostname, Opts, smtp_util:guess_FQDN()).
 
 -ifdef(TEST).
+socket_gone_kind_test_() ->
+	[?_assertEqual({ssl_closed, []}, socket_gone_kind(ranch_ssl, closed)),
+	 ?_assertEqual({tcp_closed, []}, socket_gone_kind(ranch_tcp, closed)),
+	 ?_assertEqual({ssl_error, einval}, socket_gone_kind(ranch_ssl, einval)),
+	 ?_assertEqual({tcp_error, einval}, socket_gone_kind(ranch_tcp, einval))].
+
 parse_encoded_address_test_() ->
 	[
 		{"Valid addresses should parse",

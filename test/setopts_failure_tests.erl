@@ -16,10 +16,18 @@
 
 -define(LISTENER, setopts_failure_test_listener).
 -define(TEST_PROC, setopts_failure_test_proc).
+-define(MAXSIZE, 50).
+%% Re-arming after the DATA reply is the fourth {active, once}: the replies to EHLO, MAIL and
+%% RCPT come first.
+-define(AFTER_DATA, {[{active, once}], closed, 3}).
 
 init(Hostname, SessionCount, Address, Options) ->
 	smtp_server_example:init(Hostname, SessionCount, Address, Options).
 handle_HELO(Hostname, State) -> smtp_server_example:handle_HELO(Hostname, State).
+handle_EHLO(<<"small.com">>, Extensions, State) ->
+	%% a small SIZE limit, for the message-too-large paths
+	{ok, Exts, State1} = smtp_server_example:handle_EHLO(<<"small.com">>, Extensions, State),
+	{ok, lists:keystore("SIZE", 1, Exts, {"SIZE", integer_to_list(?MAXSIZE)}), State1};
 handle_EHLO(Hostname, Extensions, State) ->
 	smtp_server_example:handle_EHLO(Hostname, Extensions, State).
 handle_MAIL(From, State) -> smtp_server_example:handle_MAIL(From, State).
@@ -76,6 +84,31 @@ setopts_failure_test_() ->
 			%% the first {active, once} after the banner is the one re-arming after EHLO
 			?assertEqual([{handle_error, tcp_closed}, {terminate, normal}],
 						 run({[{active, once}], closed}, fun(Sock) -> ehlo(Sock) end))
+		   end}},
+		  {"DATA: re-arming after handle_DATA rejects the message fails",
+		   {timeout, 15, fun() ->
+			%% an empty body: smtp_server_example:handle_DATA/4 answers 552 Message too small
+			?assertEqual([handle_DATA, {handle_error, tcp_closed}, {terminate, normal}],
+						 run(?AFTER_DATA, fun(Sock) -> send_message(Sock, "somehost.com", "\r\n.\r\n") end))
+		   end}},
+		  {"DATA: re-arming after a bare newline is rejected fails",
+		   {timeout, 15, fun() ->
+			?assertEqual([{handle_error, data_rejected}, {handle_error, tcp_closed}, {terminate, normal}],
+						 run(?AFTER_DATA, fun(Sock) -> send_message(Sock, "somehost.com", "a\nb\r\n.\r\n") end))
+		   end}},
+		  {"DATA: re-arming after the body outgrows SIZE while it is read fails",
+		   {timeout, 15, fun() ->
+			%% no end marker, so receive_data/8 stops on size and reports size_exceeded
+			?assertEqual([{handle_error, data_rejected}, {handle_error, tcp_closed}, {terminate, normal}],
+						 run(?AFTER_DATA, fun(Sock) -> send_message(Sock, "small.com", big_body()) end))
+		   end}},
+		  {"DATA: re-arming after a complete message over SIZE is rejected fails",
+		   {timeout, 15, fun() ->
+			%% the whole message arrives in one packet, so it completes before the size check
+			%% in receive_data/8 and is rejected after it is read
+			?assertEqual([{handle_error, tcp_closed}, {terminate, normal}],
+						 run(?AFTER_DATA,
+							 fun(Sock) -> send_message(Sock, "small.com", big_body() ++ "\r\n.\r\n") end))
 		   end}}]}
 	 end}.
 
@@ -116,11 +149,23 @@ stop_listener(_) ->
 	ranch:stop_listener(?LISTENER).
 
 ehlo(Sock) ->
-	ok = smtp_socket:send(Sock, "EHLO somehost.com\r\n"),
+	ehlo(Sock, "somehost.com").
+
+ehlo(Sock, Host) ->
+	ok = smtp_socket:send(Sock, ["EHLO ", Host, "\r\n"]),
 	recv_until_last_ehlo_line(Sock).
 
+send_message(Sock, Host, Body) ->
+	start_data(Sock, Host),
+	ok = smtp_socket:send(Sock, Body).
+
+big_body() -> lists:duplicate(4 * ?MAXSIZE, $x).
+
 start_data(Sock) ->
-	ok = ehlo(Sock),
+	start_data(Sock, "somehost.com").
+
+start_data(Sock, Host) ->
+	ok = ehlo(Sock, Host),
 	ok = smtp_socket:send(Sock, "MAIL FROM:<a@b.com>\r\n"),
 	{ok, "250" ++ _} = recv_line(Sock),
 	ok = smtp_socket:send(Sock, "RCPT TO:<c@d.com>\r\n"),
