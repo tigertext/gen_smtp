@@ -51,6 +51,7 @@ without_callback_format_status_test_() ->
 		Terminate = gen_smtp_server_session:format_status(terminate, [[], Raw]),
 		%% the raw state holds it twice (envelope and callback state): the checks below are live
 		[?_assertMatch({secret_state, _, <<?PASSWORD>>}, element(I, Raw)),
+		 ?_assert(contains(setelement(I, Raw, none), ?PASSWORD)),   % the envelope's copy
 		 ?_assertEqual(redacted, element(I, Normal)),
 		 ?_assertEqual(redacted, element(I, Terminate)),
 		 ?_assertNot(contains(sys:get_status(Pid), ?PASSWORD)),
@@ -123,9 +124,13 @@ undecodable_auth_test_() ->
 		                             {"LOGIN password", ["AUTH LOGIN", base64:encode_to_string("username")]},
 		                             {"CRAM-MD5 reply", ["AUTH CRAM-MD5"]}]]
 		++ [{"PLAIN inline", ?_test(begin
-			{Sock, _} = connect_ehlo(Name),
+			{Sock, Pid} = connect_ehlo(Name),
+			Ref = erlang:monitor(process, Pid),
 			ok = smtp_socket:send(Sock, "AUTH PLAIN !!!notbase64\r\n"),
 			?assertMatch({ok, "501 " ++ _}, recv(Sock)),
+			ok = smtp_socket:send(Sock, "NOOP\r\n"),
+			?assertMatch({ok, "250 " ++ _}, recv(Sock)),
+			?assertEqual([], [R || {'DOWN', R0, _, _, R} <- flush(), R0 =:= Ref]),
 			smtp_socket:close(Sock)
 		 end)}]
 	 end}.
@@ -188,12 +193,21 @@ start_server(Name, Module) ->
 		 {domain, "localhost"}, {port, 0}]).
 
 connect_ehlo(Name) ->
+	%% the previous session of this listener may still be closing
+	wait_no_sessions(Name, 100),
 	{ok, Sock} = smtp_socket:connect(tcp, "localhost", ranch:get_port({local, Name})),
 	{ok, "220 " ++ _} = recv(Sock),
 	ok = smtp_socket:send(Sock, "EHLO somehost.com\r\n"),
 	ok = recv_until_last_ehlo_line(Sock),
 	[Pid] = ranch:procs({local, Name}, connections),
 	{Sock, Pid}.
+
+wait_no_sessions(_Name, 0) -> ok;
+wait_no_sessions(Name, N) ->
+	case ranch:procs({local, Name}, connections) of
+		[] -> ok;
+		_ -> timer:sleep(10), wait_no_sessions(Name, N - 1)
+	end.
 
 flush() ->
 	receive M -> [M | flush()] after 0 -> [] end.
