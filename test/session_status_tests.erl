@@ -235,6 +235,7 @@ format_log({Msg, _Meta}) ->
 %% Opens a session, sends EHLO and Lines (each must get a 334), and returns the session's
 %% status as format_status(terminate, ...) shows it and its raw state.
 in_progress(Name, Lines) ->
+	wait_no_sessions(Name, 100),
 	{ok, Sock} = smtp_socket:connect(tcp, "localhost", ranch:get_port({local, Name})),
 	{ok, "220 " ++ _} = recv(Sock),
 	ok = smtp_socket:send(Sock, "EHLO somehost.com\r\n"),
