@@ -80,9 +80,23 @@ callback_format_status_crash_test_() ->
 		 ?_assertNot(contains(Shown, ?PASSWORD))]
 	end).
 
-%% A term that is not a session state is returned as is.
-non_session_state_is_returned_as_is_test() ->
-	?assertEqual(not_a_state, gen_smtp_server_session:format_status(terminate, [[], not_a_state])).
+%% Fails closed: a term that is not a session state is shown as `redacted', in both views.
+non_session_state_is_redacted_test() ->
+	?assertEqual(redacted, gen_smtp_server_session:format_status(terminate, [[], not_a_state])),
+	?assertEqual([{data, [{"State", redacted}]}],
+	             gen_smtp_server_session:format_status(normal, [[], not_a_state])).
+
+%% Fails closed: a session state the redaction cannot handle (here the module field is not
+%% an atom, so erlang:function_exported/3 raises) is shown as `redacted', not as is.
+redaction_that_raises_shows_redacted_test_() ->
+	with_authenticated_session(status_raising, ?CB, fun(Pid) ->
+		Raw = sys:get_state(Pid),
+		[M] = [I || I <- lists:seq(1, tuple_size(Raw)), element(I, Raw) =:= ?CB],
+		Broken = setelement(M, Raw, "not a module"),
+		[?_assertEqual(redacted, gen_smtp_server_session:format_status(terminate, [[], Broken])),
+		 ?_assertEqual([{data, [{"State", redacted}]}],
+		               gen_smtp_server_session:format_status(normal, [[], Broken]))]
+	end).
 
 %% Mid-exchange AUTH state: the CRAM-MD5 challenge (authdata) is replaced by its size, and
 %% an AUTH LOGIN that has only sent the username shows it, with no credential.

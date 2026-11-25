@@ -340,18 +340,27 @@ terminate(Reason, #state{socket = Socket, transport = Transport, module = Module
 
 %% @hidden
 %% What sys:get_status/1 and the crash report of a dying session show. The session holds
-%% secrets: the AUTH credential (envelope auth and, mid-exchange, authdata), message data,
-%% and whatever the callback module keeps in its state. Those are replaced, and the
-%% callback module can say what of its own state to show (see the format_status callback).
+%% secrets: the AUTH credential (envelope auth and, mid-exchange, authdata) and whatever
+%% the callback module keeps in its state. Those are replaced, and the callback module can
+%% say what of its own state to show (see the format_status callback).
+%%
+%% It fails closed: anything that is not a #state{}, or a redaction that raises, shows as
+%% redacted. OTP falls back to printing the raw state when format_status/2 raises.
+%%
+%% The message body is not covered here (envelope.data is still replaced, as a safeguard,
+%% but the body is normally not in the state). It only lives in the DATA receiver's variables, so
+%% it reaches a crash report through the last message ({receive_data, Body, Rest}) or the
+%% stack arguments of a crashing handle_DATA/4. Those parts of the report are not filtered
+%% by gen_smtp; the application's logger must clean them.
 -spec format_status(Opt :: normal | terminate, [list() | #state{}]) -> term().
-format_status(Opt, [PDict, #state{} = State]) ->
-	Shown = redact_state(Opt, PDict, State),
+format_status(Opt, [PDict, State]) ->
+	Shown = try redact_state(Opt, PDict, State)
+			catch _:_ -> redacted
+			end,
 	case Opt of
 		terminate -> Shown;
 		_ -> [{data, [{"State", Shown}]}]
-	end;
-format_status(_Opt, [_PDict, Other]) ->
-	Other.
+	end.
 
 %% setelement, not record update: the redacted values are outside the fields' declared types.
 redact_state(Opt, PDict, #state{module = Module, callbackstate = CallbackState,
@@ -575,7 +584,7 @@ handle_request({<<"AUTH">>, Args}, #state{extensions = Extensions, envelope = En
 									try_auth('plain', Username, Password, State);
 								[Username, Password] ->
 									try_auth('plain', Username, Password, State);
-								[undecodable] ->
+								undecodable ->
 									auth_undecodable(State);
 								_ ->
 									% TODO error
@@ -603,7 +612,7 @@ handle_request({Username64, <<>>}, #state{waitingauth = 'cram-md5', envelope = #
 	case split64(Username64, <<" ">>) of
 		[Username, Digest] ->
 			try_auth('cram-md5', Username, {Digest, AuthData}, State#state{authdata=undefined});
-		[undecodable] ->
+		undecodable ->
 			auth_undecodable(State#state{authdata=undefined});
 		_ ->
 			% TODO error
@@ -617,7 +626,7 @@ handle_request({Username64, <<>>}, #state{waitingauth = 'plain', envelope = #env
 			try_auth('plain', Username, Password, State);
 		[Username, Password] ->
 			try_auth('plain', Username, Password, State);
-		[undecodable] ->
+		undecodable ->
 			auth_undecodable(State);
 		_ ->
 			% TODO error
@@ -999,10 +1008,10 @@ decode64(Bin) ->
 	catch error:_ -> undecodable
 	end.
 
-%% Decodes, then splits on Sep; [undecodable] when the client's base64 is bad.
+%% Decodes, then splits on Sep; undecodable when the client's base64 is bad.
 split64(Bin, Sep) ->
 	case decode64(Bin) of
-		undecodable -> [undecodable];
+		undecodable -> undecodable;
 		Decoded -> binstr:split(Decoded, Sep)
 	end.
 
