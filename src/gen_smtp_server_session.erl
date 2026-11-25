@@ -245,6 +245,12 @@ handle_info({receive_data, {error, bare_newline}}, #state{readmessage = true} = 
 	send(State, "451 Bare newline detected\r\n"),
 	State1 = handle_error(data_rejected, bare_neline, State),
 	continue(State1#state{readmessage = false, envelope = #envelope{}}, [{active, once}]);
+%% The body receiver could not read from the socket: the client went away mid-DATA, or the
+%% socket failed. The partial body is dropped and the session ends with reason normal.
+handle_info({receive_data, {error, {recv, Reason}}}, #state{readmessage = true} = State) ->
+	Reason =:= closed orelse
+		?log(warning, "SMTP receive error during DATA from ~s: ~p~n", [format_peer(State#state.peer), Reason]),
+	socket_gone(Reason, State);
 handle_info({receive_data, Body, Rest},
 			#state{socket = Socket, transport = Transport, readmessage = true, envelope = Env, module=Module,
 				   callbackstate = OldCallbackState, maxsize=MaxSize} = State) ->
@@ -1000,8 +1006,9 @@ receive_data(Acc, Transport, Socket, RecvSize, Size, MaxSize, Session, Options) 
 		{error, timeout} ->
 			receive_data(Acc, Transport, Socket, 0, Size, MaxSize, Session, Options);
 		{error, Reason} ->
-			error_logger:error_msg("SMTP receive error: ~p~n", [Reason]),
-			exit(receive_error)
+			%% Report to the session rather than exit: this process is linked to it, so an
+			%% abnormal exit would take the session down too.
+			Session ! {receive_data, {error, {recv, Reason}}}
 	end.
 
 check_for_bare_crlf(Bin, Offset) ->
