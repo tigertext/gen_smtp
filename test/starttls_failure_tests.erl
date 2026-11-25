@@ -1,5 +1,5 @@
-%% Tests for a STARTTLS handshake that fails. The session must end cleanly instead of
-%% crashing on the socket that ssl already closed.
+%% Tests for a STARTTLS handshake that fails, or that succeeds and is closed by the client
+%% straight away. The session must end cleanly instead of crashing on the closed socket.
 %%
 %% This module is also the callback module under test: it delegates every callback to
 %% smtp_server_example and reports handle_error/3 and terminate/2 calls to the registered
@@ -13,6 +13,7 @@
 	handle_other/3, handle_STARTTLS/1, handle_error/3, code_change/3, terminate/2]).
 
 -define(SERVER, starttls_failure_test_server).
+-define(CLOSE_SERVER, starttls_close_test_server).
 -define(TEST_PROC, starttls_failure_test_proc).
 %% Client options that make the client abort the handshake with an alert.
 -define(REJECT_CERT, [{verify, verify_peer},
@@ -45,7 +46,7 @@ terminate(Reason, State) ->
 %% crashed in setopts/2 ({badmatch, {error, einval}}). The callback's handle_error/3 must
 %% still see the failure first, since that is where callback modules log it.
 failed_handshake_ends_session_normally_test_() ->
-	{setup, fun start_server/0, fun stop_server/1,
+	{setup, fun() -> start_server(?SERVER) end, fun(_) -> stop_server(?SERVER) end,
 	 fun(_) ->
 		[{Name, {timeout, 20, fun() -> assert_session_ends_normally(Client) end}}
 		 || {Name, Client} <-
@@ -63,7 +64,7 @@ failed_handshake_ends_session_normally_test_() ->
 assert_session_ends_normally(Client) ->
 	register(?TEST_PROC, self()),
 	try
-		Sock = starttls_220(),
+		Sock = starttls_220(?SERVER),
 		%% Close the client socket on every exit, including a timeout below.
 		try
 			{error, _} = Client(Sock),
@@ -81,10 +82,48 @@ assert_session_ends_normally(Client) ->
 		unregister(?TEST_PROC)
 	end.
 
-start_server() ->
+%% A client that completes the handshake and closes at once (scanners and probes do this)
+%% races the session's next setopts/2 on the TLS socket. That used to crash the session with
+%% {badmatch, {error, closed}} (CP-918). Repeated, because the race is lost only some of the
+%% time: 6 crashes in 30 tries on OTP 22.2.
+-define(CLOSE_AFTER_HANDSHAKE_TRIES, 30).
+
+closed_right_after_handshake_ends_session_normally_test_() ->
+	{setup, fun() -> start_server(?CLOSE_SERVER) end, fun(_) -> stop_server(?CLOSE_SERVER) end,
+	 fun(_) ->
+		{timeout, 120, fun() ->
+			Reasons = [close_right_after_handshake() || _ <- lists:seq(1, ?CLOSE_AFTER_HANDSHAKE_TRIES)],
+			?assertEqual([], [R || R <- Reasons, R =/= normal])
+		end}
+	 end}.
+
+%% Returns the reason the session ended with.
+close_right_after_handshake() ->
+	register(?TEST_PROC, self()),
+	try
+		Sock = starttls_220(?CLOSE_SERVER),
+		try
+			{ok, SslSock} = ssl:connect(Sock, [{active, false}, {verify, verify_none}], 5000),
+			ok = ssl:close(SslSock),
+			%% handle_error/3 hears about the closed TLS socket first, whichever way the
+			%% race went
+			Session = receive {handle_error, Pid, ssl_closed} -> Pid
+					  after 5000 -> error(handle_error_not_called)
+					  end,
+			receive {session_terminated, Session, Reason} -> Reason
+			after 5000 -> error(session_not_terminated)
+			end
+		after
+			catch smtp_socket:close(Sock)
+		end
+	after
+		unregister(?TEST_PROC)
+	end.
+
+start_server(Name) ->
 	gen_smtp_application:ensure_all_started(gen_smtp),
 	{ok, Pid} = gen_smtp_server:start(
-		{local, ?SERVER},
+		{local, Name},
 		?MODULE,
 		[{sessionoptions,
 		  [{tls_options,
@@ -97,12 +136,12 @@ start_server() ->
 		 {port, 0}]),
 	Pid.
 
-stop_server(_Pid) ->
-	gen_smtp_server:stop(?SERVER).
+stop_server(Name) ->
+	gen_smtp_server:stop(Name).
 
 %% Connects, sends EHLO and STARTTLS, and returns the plain socket once the server said 220.
-starttls_220() ->
-	{ok, Sock} = smtp_socket:connect(tcp, "localhost", ranch:get_port({local, ?SERVER})),
+starttls_220(Name) ->
+	{ok, Sock} = smtp_socket:connect(tcp, "localhost", ranch:get_port({local, Name})),
 	{ok, "220 " ++ _} = recv_line(Sock),
 	ok = smtp_socket:send(Sock, "EHLO somehost.com\r\n"),
 	ok = recv_until_last_ehlo_line(Sock),
