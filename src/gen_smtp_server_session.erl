@@ -254,7 +254,9 @@ handle_info({receive_data, Body, Rest},
 		_ -> self() ! {Transport:name(), Socket, Rest}
 	end,
 	%% The message is complete, so it is handled even if the client has already gone;
-	%% the continue/2 after handle_DATA ends the session in that case.
+	%% the continue/2 after handle_DATA ends the session in that case. A client that sent
+	%% the final "." and dropped before reading the 250 may retry, so it can be delivered
+	%% twice: the usual MTA behaviour once the dot has arrived.
 	_ = setopts(State, [{packet, line}]),
 	%% Unescape periods at start of line (rfc5321 4.5.2)
 	UnescapedBody = re:replace(Body, <<"^\\\.">>, <<>>, [global, multiline, {return, binary}]),
@@ -771,7 +773,7 @@ handle_request({<<"STARTTLS">>, <<>>}, #state{socket = Socket, module = Module, 
 					?log(debug, "SSL negotiation sucessful~n"),
 					%% Result ignored: if the client has already closed, the continue/2 that
 					%% re-arms the socket after this command ends the session (CP-918).
-					ranch_ssl:setopts(NewSocket, [{packet, line}]),
+					_ = ranch_ssl:setopts(NewSocket, [{packet, line}]),
 					{ok, State#state{socket = NewSocket, transport = ranch_ssl, envelope=undefined,
 							authdata=undefined, waitingauth=false, readmessage=false,
 							tls=true, callbackstate = callback_starttls(Module, NewSocket, OldCallbackState)}};

@@ -3,6 +3,9 @@
 %% client has gone (CP-918). fail_setopts_transport makes setopts/2 fail from a chosen call
 %% on, so every path is hit deterministically.
 %%
+%% Needs ranch 1.6 or later (start_listener/5 with a transport module): under the ranch13
+%% profile it fails with undef.
+%%
 %% This module is also the callback module under test: it delegates every callback to
 %% smtp_server_example and reports handle_error/3, handle_DATA/4 and terminate/2 calls to
 %% the registered test process.
